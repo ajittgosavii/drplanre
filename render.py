@@ -1,213 +1,309 @@
-"""SVG diagram of a simulator state, with an optional highlighted probe path."""
-from html import escape
+"""SVG diagram of a simulator state, with an optional highlighted probe path.
 
-W, H = 1200, 880
-TOP = 80                                   # vendor band height
+Every line is clipped to the outline of the shapes it joins (boxes, circles), lines are drawn under the boxes, and
+components that are not built yet appear as faint dashed placeholders so the layout never has unexplained gaps.
+"""
+from html import escape
+import math
+
+W = 1200
 COL = {"ink": "#1B2A41", "muted": "#7D8998", "navy": "#0B3C5D", "teal": "#0B6E79", "rust": "#C8553D", "amber": "#E9A23B",
        "green": "#2E7D32", "purple": "#5B4B8A", "prod": "#E6F2FF", "prodL": "#147EBA", "dr": "#FDF0E3", "drill": "#DFF3DA",
-       "ad": "#FFF8D6", "down": "#FDECEC", "grey": "#B8C2CC"}
+       "ad": "#FFF8D6", "down": "#FDECEA", "grey": "#B8C2CC", "ghost": "#C9D1DA"}
 
+# y = 0..80 is the vendor band
 LAYOUT = {
-    1: {"regions": {"A": (15, 15, 575, 640), "B": (610, 15, 575, 640)},
-        "tgw": {"TGW-A": (505, 130), "TGW-B": (695, 130)},
-        "vpc": {"VPC-A": (35, 75, 330), "MIR-B": (35, 330, 250), "BUB-A": (305, 330, 250),
-                "VPC-B": (835, 75, 330), "MIR-A": (915, 330, 250), "BUB-B": (645, 330, 250)},
-        "edge": {"A": (300, 600), "B": (900, 600)},
-        "plant": {"A": (300, 735), "B": (900, 735)}},
-    2: {"regions": {"A": (15, 15, 440, 345), "B": (15, 380, 440, 345), "C": (480, 15, 705, 710)},
-        "tgw": {"TGW-A": (390, 125), "TGW-B": (390, 490), "TGW-C": (555, 370)},
-        "vpc": {"VPC-A": (30, 65, 270), "VPC-B": (30, 430, 270), "DR-C": (640, 65, 250), "SS-C": (920, 65, 250),
-                "MIR-A": (640, 270, 250), "MIR-B": (920, 270, 250), "BUB-C": (640, 470, 250)},
-        "edge": {"A": (390, 300), "B": (390, 665), "C": (1045, 665)},
-        "plant": {"A": (230, 752), "B": (760, 752)}},
+    1: {"H": 690, "gutter": 600,
+        "regions": {"A": (15, 92, 575, 478), "B": (610, 92, 575, 478)},
+        "tgw": {"TGW-A": (505, 205), "TGW-B": (695, 205)},
+        "vpc": {"VPC-A": (35, 140, 330), "MIR-B": (35, 345, 220), "BUB-A": (265, 345, 200),
+                "VPC-B": (835, 140, 330), "MIR-A": (945, 345, 220), "BUB-B": (735, 345, 200)},
+        "edge": {"A": (480, 500), "B": (720, 500)},
+        "plant": {"A": (300, 620), "B": (900, 620)},
+        "vendor": {"V1": (230, 40), "V3": (600, 40), "DC1": (970, 40)}},
+    2: {"H": 740, "gutter": 565,
+        "regions": {"A": (175, 92, 380, 300), "B": (175, 405, 380, 300), "C": (575, 92, 610, 613)},
+        "tgw": {"TGW-A": (485, 200), "TGW-B": (485, 515), "TGW-C": (630, 400)},
+        "vpc": {"VPC-A": (190, 140, 225), "VPC-B": (190, 453, 225), "DR-C": (690, 140, 235), "SS-C": (940, 140, 235),
+                "MIR-A": (690, 300, 235), "MIR-B": (940, 300, 235), "BUB-C": (940, 470, 235)},
+        "edge": {"A": (300, 335), "B": (300, 650), "C": (720, 640)},
+        "plant": {"A": (88, 335, 150, 56), "B": (88, 650, 150, 56)},
+        "vendor": {"V1": (230, 40), "V3": (600, 40), "DC1": (970, 40)}},
 }
-# shift the whole drawing down to make room for the vendor band
-for _lay in LAYOUT.values():
-    _lay["regions"] = {k: (x, y + TOP, w, h) for k, (x, y, w, h) in _lay["regions"].items()}
-    for _g in ("tgw", "edge", "plant"):
-        _lay[_g] = {k: (x, y + TOP) for k, (x, y) in _lay[_g].items()}
-    _lay["vpc"] = {k: (x, y + TOP, w) for k, (x, y, w) in _lay["vpc"].items()}
-LAYOUT[1]["vendor"] = {"V1": (230, 42), "V3": (600, 42), "DC1": (970, 42)}
-LAYOUT[2]["vendor"] = {"V1": (230, 42), "V3": (600, 42), "DC1": (970, 42)}
+GHOST = {"MIR-A": "Mirror of PLC-A", "MIR-B": "Mirror of PLC-B", "BUB-A": "Drill bubble us-east-1", "BUB-B": "Drill bubble us-west-2",
+         "BUB-C": "Drill bubble us-east-2", "DR-C": "DR VPC (DR-C)", "SS-C": "Shared Services (AD) us-east-2"}
 FILL = {"prod": (COL["prod"], COL["prodL"]), "mirror": (COL["dr"], COL["rust"]), "bubble": (COL["drill"], COL["green"]),
         "dr": (COL["dr"], COL["amber"]), "ad": (COL["ad"], "#B58B00")}
 DOT = {"running": COL["green"], "stopped": COL["muted"], "down": COL["rust"]}
+TGW_R = 40
 
 
 def _t(x, y, s, size=12, color=None, weight="normal", anchor="start", italic=False):
-    return (f'<text x="{x}" y="{y}" font-family="Calibri, Segoe UI, Arial, sans-serif" font-size="{size}" fill="{color or COL["ink"]}" '
+    return (f'<text x="{x:.1f}" y="{y:.1f}" font-family="Calibri, Segoe UI, Arial, sans-serif" font-size="{size}" fill="{color or COL["ink"]}" '
             f'font-weight="{weight}" text-anchor="{anchor}"{" font-style=\"italic\"" if italic else ""}>{escape(str(s))}</text>')
 
 
 def _vpc_box(st, name):
-    lay = LAYOUT[st["option"]]["vpc"][name]
+    x, y, w = LAYOUT[st["option"]]["vpc"][name]
     hosts = [h for h in st["hosts"] if h["vpc"] == name]
-    h = 44 + 21 * max(len(hosts), 1)
-    return lay[0], lay[1], lay[2], h, hosts
+    return x, y, w, 44 + 20 * max(len(hosts), 1), hosts
 
 
-def centers(st):
+def _edge_h(st, k):
+    return 62 if st["fw"].get(k, {}).get("nat") else 44
+
+
+def geometry(st):
+    """node id -> ('rect', x, y, w, h) | ('circle', cx, cy, r) for everything drawn (built or placeholder)."""
     lay = LAYOUT[st["option"]]
-    c = {}
-    for v in st["vpcs"]:
-        if v in lay["vpc"]:
-            x, y, w, h, _ = _vpc_box(st, v)
-            c[v] = (x + w / 2, y + h / 2)
-    for t, p in lay["tgw"].items():
-        c[t] = p
-    for k, p in lay["edge"].items():
-        c["edge-" + k] = p
-    for k, p in lay["plant"].items():
-        c["plant-" + k] = p
-    for k, p in lay["vendor"].items():
-        c["vendor-" + k] = p
-    return c
+    g = {}
+    for v, (x, y, w) in lay["vpc"].items():
+        if v in st["vpcs"]:
+            bx, by, bw, bh, _ = _vpc_box(st, v)
+            g[v] = ("rect", bx, by, bw, bh)
+        else:
+            g[v] = ("rect", x, y, w, 56)
+    for t, (cx, cy) in lay["tgw"].items():
+        g[t] = ("circle", cx, cy, TGW_R)
+    for k, (cx, cy) in lay["edge"].items():
+        g["edge-" + k] = ("rect", cx - 105, cy - 22, 210, _edge_h(st, k))
+    for k, v in lay["plant"].items():
+        cx, cy, pw, ph = (v + (240, 40)) if len(v) == 2 else v
+        g["plant-" + k] = ("rect", cx - pw / 2, cy - ph / 2, pw, ph)
+    for k, (cx, cy) in lay["vendor"].items():
+        g["vendor-" + k] = ("rect", cx - 125, cy - 24, 250, 46)
+    return g
+
+
+def _center(s):
+    return (s[1], s[2]) if s[0] == "circle" else (s[1] + s[3] / 2, s[2] + s[4] / 2)
+
+
+def _clip(s, toward):
+    """Point where the segment from the shape's centre towards `toward` leaves the shape."""
+    cx, cy = _center(s)
+    dx, dy = toward[0] - cx, toward[1] - cy
+    if dx == 0 and dy == 0:
+        return cx, cy
+    if s[0] == "circle":
+        d = math.hypot(dx, dy)
+        return cx + dx / d * (s[3] + 1), cy + dy / d * (s[3] + 1)
+    hw, hh = s[3] / 2 + 1, s[4] / 2 + 1
+    t = min(hw / abs(dx) if dx else math.inf, hh / abs(dy) if dy else math.inf)
+    return cx + dx * t, cy + dy * t
+
+
+def _seg(g, a, b):
+    sa, sb = g[a], g[b]
+    return _clip(sa, _center(sb)), _clip(sb, _center(sa))
+
+
+def _route(st, g, a, b):
+    """Points for a connection a -> b. Vendor tunnels run down to a bus under the vendor band and along the gutter
+    between the Regions, so they never cut across a Region."""
+    rev = False
+    if b.startswith("vendor-") and a.startswith("TGW-"):
+        a, b, rev = b, a, True
+    if a.startswith("vendor-") and b.startswith("TGW-"):
+        gx = LAYOUT[st["option"]]["gutter"]
+        vx, vy = _center(g[a])
+        tx, ty = _center(g[b])
+        pts = [(vx, vy + 24), (vx, 84), (gx, 84), (gx, ty), _clip(g[b], (gx, ty))]
+        return pts[::-1] if rev else pts
+    if rev:
+        a, b = b, a
+    return list(_seg(g, a, b))
+
+
+def _poly(pts, color, width=2.0, dash=None, opacity=1.0, marker=False):
+    d = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    return (f'<polyline points="{d}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linejoin="round" stroke-linecap="round"'
+            f'{f" stroke-dasharray=\"{dash}\"" if dash else ""} opacity="{opacity}"{" marker-end=\"url(#arr)\"" if marker else ""}/>')
+
+
+def _line(p1, p2, color, width=2.0, dash=None, opacity=1.0, marker=False):
+    return (f'<line x1="{p1[0]:.1f}" y1="{p1[1]:.1f}" x2="{p2[0]:.1f}" y2="{p2[1]:.1f}" stroke="{color}" stroke-width="{width}" '
+            f'stroke-linecap="round"{f" stroke-dasharray=\"{dash}\"" if dash else ""} opacity="{opacity}"{" marker-end=\"url(#arr)\"" if marker else ""}/>')
 
 
 def svg(st, path=None, added_targets=(), title=""):
     lay = LAYOUT[st["option"]]
-    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" style="background:#fff;border:1px solid #E3E8EE;border-radius:10px">',
-           '<defs><marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
-           '<path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker></defs>']
-    cen = centers(st)
-    # regions
+    H = lay["H"]
+    g = geometry(st)
+    back, mid, front = [], [], []          # lines under boxes, boxes, overlay
+
+    # ---------------- regions
     for k, (x, y, w, h) in lay["regions"].items():
         if k not in st["regions"]:
             continue
         up = st["regions"][k]["up"]
         built = k != "C" or "TGW-C" in st["tgws"] or "DR-C" in st["vpcs"]
         stroke = COL["teal"] if k == "C" else (COL["rust"] if st["option"] == 1 else COL["muted"])
-        out.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="14" fill="{COL["down"] if not up else "#FFFFFF"}" '
-                   f'stroke="{stroke}" stroke-width="2" stroke-dasharray="8 5" opacity="{1 if built else 0.45}"/>')
+        back.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="14" fill="{COL["down"] if not up else "#FFFFFF"}" '
+                    f'stroke="{stroke}" stroke-width="2" stroke-dasharray="8 5" opacity="{1 if built else 0.5}"/>')
         sub = {1: "production + DR for the other Region", 2: "production only" if k != "C" else "DR account"}[st["option"]]
-        out.append(_t(x + 14, y + 24, f'{st["regions"][k]["name"]} ({k})', 17, stroke, "bold"))
-        out.append(_t(x + 14, y + 42, sub if built else "not built yet", 12, COL["muted"]))
+        back.append(_t(x + 14, y + 22, f'{st["regions"][k]["name"]} ({k})', 16, stroke, "bold"))
+        back.append(_t(x + 14, y + 38, sub if built else "not built yet", 11, COL["muted"]))
         if not up:
-            out.append(_t(x + w - 14, y + 26, "REGION DOWN", 16, COL["rust"], "bold", "end"))
-    # peerings + edge links
+            back.append(_t(x + w - 14, y + 24, "REGION DOWN", 15, COL["rust"], "bold", "end"))
+
+    # ---------------- connecting lines (under the boxes)
+    for pk in lay["plant"]:
+        for ek in lay["edge"]:
+            if st["edges"].get(ek):
+                p1, p2 = _seg(g, "plant-" + pk, "edge-" + ek)
+                back.append(_line(p1, p2, COL["grey"], 1.5 if pk == ek else 1.1, "4 5", 0.9 if pk == ek else 0.35))
+    for t, tg in st["tgws"].items():
+        up_t = st["regions"][tg["region"]]["up"]
+        for a, v in tg["atts"].items():
+            if v["type"] == "vpn" and "vendor-" + v["vendor"] in g:
+                back.append(_poly(_route(st, g, "vendor-" + v["vendor"], t), COL["purple"] if up_t else COL["rust"], 1.3, "3 4", 0.45))
+            if v["type"] == "sdwan":
+                p1, p2 = _seg(g, t, "edge-" + tg["region"])
+                back.append(_line(p1, p2, COL["grey"], 3))
     drawn = set()
     for t, tg in st["tgws"].items():
         for a, v in tg["atts"].items():
             if v["type"] == "peering" and a not in drawn:
                 drawn.add(a)
-                (x1, y1), (x2, y2) = cen[t], cen[v["peer"][0]]
-                ok = st["regions"][tg["region"]]["up"] and st["regions"][st["tgws"][v["peer"][0]]["region"]]["up"]
-                out.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{COL["purple"] if ok else COL["rust"]}" stroke-width="4" '
-                           f'{"" if ok else "stroke-dasharray=\"10 6\""} opacity="0.85"/>')
-                out.append(_t((x1 + x2) / 2, (y1 + y2) / 2 - 10, a, 12, COL["purple"] if ok else COL["rust"], "bold", "middle"))
-            if v["type"] == "sdwan":
-                k = tg["region"]
-                (x1, y1), (x2, y2) = cen[t], cen["edge-" + k]
-                out.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2 - 22}" stroke="{COL["grey"]}" stroke-width="3"/>')
-    # vendor VPN tunnels
-    for t, tg in st["tgws"].items():
-        for a, v in tg["atts"].items():
-            if v["type"] == "vpn":
-                (x1, y1), (x2, y2) = cen["vendor-" + v["vendor"]], cen[t]
-                up = st["regions"][tg["region"]]["up"]
-                out.append(f'<line x1="{x1}" y1="{y1 + 20}" x2="{x2}" y2="{y2}" stroke="{COL["purple"] if up else COL["rust"]}" stroke-width="1.6" '
-                           f'stroke-dasharray="3 4" opacity="{0.55 if up else 0.4}"/>')
-    # plants to edges
-    for pk, (px, py) in lay["plant"].items():
-        for ek in lay["edge"]:
-            if st["edges"].get(ek):
-                ex, ey = lay["edge"][ek]
-                out.append(f'<line x1="{px}" y1="{py - 20}" x2="{ex}" y2="{ey + 22}" stroke="{COL["grey"]}" stroke-width="1.5" stroke-dasharray="5 5"/>')
-    # vpc attachments
+                other = v["peer"][0]
+                ok = st["regions"][tg["region"]]["up"] and st["regions"][st["tgws"][other]["region"]]["up"]
+                p1, p2 = _seg(g, t, other)
+                back.append(_line(p1, p2, COL["purple"] if ok else COL["rust"], 4, None if ok else "10 6", 0.9))
+                mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+                back.append(f'<rect x="{mx - 32:.1f}" y="{my - 21:.1f}" width="64" height="16" rx="3" fill="#FFFFFF" opacity="0.9"/>')
+                back.append(_t(mx, my - 9, a, 11, COL["purple"] if ok else COL["rust"], "bold", "middle"))
     for v, vv in st["vpcs"].items():
         if v not in lay["vpc"] or not vv["att"]:
             continue
         tgw, att = vv["att"]
-        x, y, w, h, _ = _vpc_box(st, v)
-        tx, ty = cen[tgw]
-        sx = x + w if tx > x + w / 2 else x
-        props = [rn for rn, r in st["tgws"][tgw]["rts"].items() for z in r["routes"] if z["target"] == att and z["kind"] == "propagated"]
+        p1, p2 = _seg(g, v, tgw)
+        props = sorted({rn for rn, r in st["tgws"][tgw]["rts"].items() for z in r["routes"] if z["target"] == att and z["kind"] == "propagated"})
         assoc = any(att in r["assoc"] for r in st["tgws"][tgw]["rts"].values())
         bad = vv["kind"] == "mirror" and props
         col = COL["rust"] if bad else (COL["amber"] if vv["kind"] == "mirror" else COL["grey"])
-        out.append(f'<line x1="{sx}" y1="{y + 22}" x2="{tx}" y2="{ty}" stroke="{col}" stroke-width="{5 if bad else 3}" {"" if assoc else "stroke-dasharray=\"4 5\""}/>')
-        if vv["kind"] == "mirror":
-            label = "PROPAGATED into " + ", ".join(sorted(set(props))) if bad else ("associated, not propagated" if assoc else "attached, not associated")
-            lx = (sx + tx) / 2
-            out.append(_t(lx, (y + 22 + ty) / 2 - 6, label, 11, COL["rust"] if bad else COL["muted"], "bold" if bad else "normal", "middle"))
-    # tgws
+        back.append(_line(p1, p2, col, 5 if bad else 3, None if assoc else "4 5"))
+
+    # ---------------- VPC boxes (and placeholders)
+    for v in lay["vpc"]:
+        if v not in st["vpcs"]:
+            if v in GHOST:
+                _, x, y, w, h = g[v]
+                mid.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="#FAFBFC" stroke="{COL["ghost"]}" stroke-width="1.4" stroke-dasharray="5 4"/>')
+                mid.append(_t(x + 10, y + 22, GHOST[v], 12, COL["muted"], "bold"))
+                mid.append(_t(x + 10, y + 40, "not built yet", 11, COL["muted"], italic=True))
+            continue
+        vv = st["vpcs"][v]
+        x, y, w, h, hosts = _vpc_box(st, v)
+        fill, line = FILL[vv["kind"]]
+        down = not st["regions"][vv["region"]]["up"]
+        mid.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="{COL["down"] if down else fill}" stroke="{line}" stroke-width="1.6"/>')
+        mid.append(_t(x + 10, y + 18, vv["label"], 13, COL["ink"], "bold"))
+        status = ""
+        if vv["kind"] == "mirror" and vv["att"]:
+            tgw, att = vv["att"]
+            props = sorted({rn for rn, r in st["tgws"][tgw]["rts"].items() for z in r["routes"] if z["target"] == att and z["kind"] == "propagated"})
+            assoc = any(att in r["assoc"] for r in st["tgws"][tgw]["rts"].values())
+            status = ("  PROPAGATED: " + ", ".join(props)) if props else ("  - associated, not propagated" if assoc else "  - attached only")
+        mid.append(_t(x + 10, y + 33, ", ".join(vv["cidrs"]) + ("" if vv["att"] else "   (not attached)"), 11, COL["muted"]))
+        if status:
+            mid.append(_t(x + w - 10, y + 33, status.strip(" -"), 10, COL["rust"] if "PROPAGATED" in status else COL["muted"], "bold" if "PROPAGATED" in status else "normal", "end"))
+        if not hosts:
+            mid.append(_t(x + 10, y + 54, "empty" if vv["kind"] == "mirror" else "-", 11, COL["muted"], italic=True))
+        for i, hh in enumerate(hosts):
+            yy = y + 52 + 20 * i
+            col = DOT.get(hh["state"], COL["muted"])
+            if hh["copy_of"] and hh["state"] == "running":
+                col = COL["prodL"]
+            mid.append(f'<circle cx="{x + 16}" cy="{yy - 4}" r="5.5" fill="{col}"/>')
+            mid.append(_t(x + 28, yy, hh["name"], 12, COL["ink"], "bold"))
+            mid.append(_t(x + w - 10, yy, f'{hh["ip"]}  {hh["state"]}', 11, COL["muted"], anchor="end"))
+
+    # ---------------- TGWs
     for t, (cx, cy) in lay["tgw"].items():
         if t not in st["tgws"]:
+            mid.append(f'<circle cx="{cx}" cy="{cy}" r="{TGW_R}" fill="#FAFBFC" stroke="{COL["ghost"]}" stroke-width="1.6" stroke-dasharray="5 4"/>')
+            mid.append(_t(cx, cy + 4, t, 13, COL["muted"], "bold", "middle"))
+            mid.append(_t(cx, cy + TGW_R + 16, "not built yet", 11, COL["muted"], anchor="middle", italic=True))
             continue
         tg = st["tgws"][t]
         up = st["regions"][tg["region"]]["up"]
         hit = t in added_targets
-        out.append(f'<circle cx="{cx}" cy="{cy}" r="44" fill="{COL["purple"] if up else COL["grey"]}" stroke="{COL["green"] if hit else "none"}" stroke-width="6"/>')
-        out.append(_t(cx, cy - 2, t, 15, "#FFFFFF", "bold", "middle"))
-        out.append(_t(cx, cy + 15, st["regions"][tg["region"]]["name"], 11, "#FFFFFF", anchor="middle"))
+        mid.append(f'<circle cx="{cx}" cy="{cy}" r="{TGW_R}" fill="{COL["purple"] if up else COL["grey"]}" stroke="{COL["green"] if hit else "#FFFFFF"}" stroke-width="{6 if hit else 2}"/>')
+        mid.append(_t(cx, cy - 1, t, 14, "#FFFFFF", "bold", "middle"))
+        mid.append(_t(cx, cy + 15, st["regions"][tg["region"]]["name"], 10, "#FFFFFF", anchor="middle"))
         d = "defaults ON" if (tg["default_prop"] or tg["default_assoc"]) else "defaults OFF"
-        out.append(_t(cx, cy + 62, d, 12, COL["rust"] if d == "defaults ON" else COL["teal"], "bold", "middle"))
+        mid.append(_t(cx, cy + TGW_R + 16, d, 11, COL["rust"] if d == "defaults ON" else COL["teal"], "bold", "middle"))
         if hit:
-            out.append(_t(cx, cy - 52, "routes changed", 12, COL["green"], "bold", "middle"))
-    # edges
+            mid.append(_t(cx, cy - TGW_R - 8, "routes changed", 11, COL["green"], "bold", "middle"))
+
+    # ---------------- Palo Alto + SD-WAN
     for k, (cx, cy) in lay["edge"].items():
-        if k not in st["regions"] or not st["edges"].get(k):
+        if k not in st["regions"]:
+            continue
+        _, x, y, w, h = g["edge-" + k]
+        if not st["edges"].get(k):
+            mid.append(f'<rect x="{x}" y="{y}" width="{w}" height="44" rx="8" fill="#FAFBFC" stroke="{COL["ghost"]}" stroke-width="1.4" stroke-dasharray="5 4"/>')
+            mid.append(_t(cx, cy - 3, f"Palo Alto + SD-WAN pair {k}", 12, COL["muted"], "bold", "middle"))
+            mid.append(_t(cx, cy + 13, "not built yet", 11, COL["muted"], anchor="middle", italic=True))
             continue
         up = st["regions"][k]["up"]
-        hh = 62 if st["fw"].get(k, {}).get("nat") else 44
-        out.append(f'<rect x="{cx - 105}" y="{cy - 22}" width="210" height="{hh}" rx="8" fill="{"#F4F6F9" if up else COL["down"]}" stroke="{COL["muted"]}" stroke-width="1.5"/>')
-        out.append(_t(cx, cy - 3, f"Palo Alto + SD-WAN pair {k}", 13, COL["ink"], "bold", "middle"))
+        mid.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="{"#F4F6F9" if up else COL["down"]}" stroke="{COL["muted"]}" stroke-width="1.5"/>')
+        mid.append(_t(cx, cy - 3, f"Palo Alto + SD-WAN pair {k}", 13, COL["ink"], "bold", "middle"))
         fw = st["fw"].get(k, {"plants": [], "nat": {}})
         rules = ", ".join(c for c in fw["plants"] if c.startswith("10.") and c.endswith("/24")) or "-"
-        out.append(_t(cx, cy + 14, "PLC rules: " + rules, 10, COL["muted"], anchor="middle"))
+        mid.append(_t(cx, cy + 13, "pre-staged PLC rules: " + rules, 10, COL["muted"], anchor="middle"))
         if fw["nat"]:
-            out.append(_t(cx, cy + 32, "DNAT " + ", ".join(sorted(fw["nat"])), 10, COL["purple"], "bold", "middle"))
-    # vpcs
-    for v, vv in st["vpcs"].items():
-        if v not in lay["vpc"]:
-            continue
-        x, y, w, h, hosts = _vpc_box(st, v)
-        fill, line = FILL[vv["kind"]]
-        down = not st["regions"][vv["region"]]["up"]
-        out.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="{COL["down"] if down else fill}" stroke="{line}" stroke-width="1.6"/>')
-        out.append(_t(x + 10, y + 18, vv["label"], 13, COL["ink"], "bold"))
-        out.append(_t(x + 10, y + 34, ", ".join(vv["cidrs"]) + ("" if vv["att"] else "   (not attached)"), 11, COL["muted"]))
-        if not hosts:
-            out.append(_t(x + 10, y + 56, "empty" if vv["kind"] == "mirror" else "-", 11, COL["muted"], italic=True))
-        for i, hh in enumerate(hosts):
-            yy = y + 52 + 21 * i
-            col = DOT.get(hh["state"], COL["muted"])
-            if hh["copy_of"] and hh["state"] == "running":
-                col = COL["prodL"]
-            out.append(f'<circle cx="{x + 16}" cy="{yy - 4}" r="5.5" fill="{col}"/>')
-            out.append(_t(x + 28, yy, hh["name"], 12, COL["ink"], "bold"))
-            out.append(_t(x + w - 10, yy, f'{hh["ip"]}  {hh["state"]}', 11, COL["muted"], anchor="end"))
-    # vendors
+            mid.append(_t(cx, cy + 30, "DNAT " + ", ".join(sorted(fw["nat"])), 10, COL["purple"], "bold", "middle"))
+
+    # ---------------- vendors and plants
     for k, (cx, cy) in lay["vendor"].items():
         if k not in st["vendors"]:
             continue
         v = st["vendors"][k]
-        out.append(f'<rect x="{cx - 115}" y="{cy - 24}" width="230" height="46" rx="8" fill="#F3EFFA" stroke="{COL["purple"]}" stroke-width="1.6"/>')
-        out.append(_t(cx, cy - 6, f'{v["label"]} - {v["how"]}', 13, COL["purple"], "bold", "middle"))
+        _, x, y, w, h = g["vendor-" + k]
+        mid.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="#F3EFFA" stroke="{COL["purple"]}" stroke-width="1.6"/>')
+        mid.append(_t(cx, cy - 5, f'{v["label"]} - {v["how"]}', 13, COL["purple"], "bold", "middle"))
         reach = "DNAT + PLCs" if "DNAT" in v["how"] else ("servers" if v["mode"] == "bgp" else "servers + PLCs")
         moved = any(len(r) > 1 for r in v["sel"].values())
-        out.append(_t(cx, cy + 12, v["cidr"] + "  ->  " + reach + ("  (backup peer)" if moved else ""), 11, COL["muted"], anchor="middle"))
-    # plants
-    for k, (cx, cy) in lay["plant"].items():
-        out.append(f'<rect x="{cx - 120}" y="{cy - 20}" width="240" height="40" rx="8" fill="#FFFFFF" stroke="{COL["navy"]}" stroke-width="1.6"/>')
-        out.append(_t(cx, cy + 5, f"Plants {'east' if k == 'A' else 'west'} (PLCs, HMIs)", 13, COL["navy"], "bold", "middle"))
-    # path
+        mid.append(_t(cx, cy + 12, v["cidr"] + "  ->  " + reach + ("  (backup peer)" if moved else ""), 11, COL["muted"], anchor="middle"))
+    for k in lay["plant"]:
+        _, x, y, w, h = g["plant-" + k]
+        cx, cy = x + w / 2, y + h / 2
+        mid.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="#FFFFFF" stroke="{COL["navy"]}" stroke-width="1.6"/>')
+        name = f"Plants {'east' if k == 'A' else 'west'}"
+        if w < 200:
+            mid.append(_t(cx, cy - 3, name, 13, COL["navy"], "bold", "middle"))
+            mid.append(_t(cx, cy + 14, "PLCs, HMIs", 11, COL["navy"], anchor="middle"))
+        else:
+            mid.append(_t(cx, cy + 5, name + " (PLCs, HMIs)", 13, COL["navy"], "bold", "middle"))
+
+    # ---------------- highlighted path (on top, clipped to the shapes so text stays readable)
     if path and path.get("hops"):
-        pts = [cen[h] for h in path["hops"] if h in cen]
-        if len(pts) >= 2:
-            col = {"ok": COL["green"], "blocked": COL["teal"]}.get(path.get("status"), COL["rust"])
-            pl = " ".join(f"{x},{y}" for x, y in pts)
-            out.append(f'<polyline points="{pl}" fill="none" stroke="{col}" stroke-width="7" stroke-linejoin="round" opacity="0.55" marker-end="url(#arr)"/>')
-            if path.get("status") in ("fail", "breach"):
-                x, y = pts[-1]
-                out.append(f'<g stroke="{COL["rust"]}" stroke-width="7" stroke-linecap="round"><line x1="{x - 16}" y1="{y - 16}" x2="{x + 16}" y2="{y + 16}"/>'
-                           f'<line x1="{x - 16}" y1="{y + 16}" x2="{x + 16}" y2="{y - 16}"/></g>')
-    # legend
-    lx, ly = 20, H - 8
+        hops = [h for h in path["hops"] if h in g]
+        if len(hops) > 1 and hops[0].startswith("vendor-") and hops[1].startswith("edge-"):
+            del hops[1]                                  # the VPN lands on the TGW; inspection shows as TGW -> firewall -> TGW
+        hops = [h for i, h in enumerate(hops) if i == 0 or h != hops[i - 1]]
+        col = {"ok": COL["green"], "blocked": COL["teal"]}.get(path.get("status"), COL["rust"])
+        for a, b in zip(hops, hops[1:]):
+            front.append(_poly(_route(st, g, a, b), col, 6, None, 0.75, marker=True))
+        if path.get("status") in ("fail", "breach") and hops:
+            x, y = _center(g[hops[-1]])
+            front.append(f'<g stroke="{COL["rust"]}" stroke-width="6" stroke-linecap="round" opacity="0.9"><line x1="{x - 14}" y1="{y - 14}" x2="{x + 14}" y2="{y + 14}"/>'
+                         f'<line x1="{x - 14}" y1="{y + 14}" x2="{x + 14}" y2="{y - 14}"/></g>')
+
+    # ---------------- legend
+    leg = []
+    lx, ly = 20, H - 10
     for i, (lab, col) in enumerate([("running", COL["green"]), ("DR copy running", COL["prodL"]), ("stopped", COL["muted"]), ("down", COL["rust"])]):
-        out.append(f'<circle cx="{lx + i * 150}" cy="{ly - 4}" r="5.5" fill="{col}"/>')
-        out.append(_t(lx + 10 + i * 150, ly, lab, 11, COL["muted"]))
+        leg.append(f'<circle cx="{lx + i * 140}" cy="{ly - 4}" r="5.5" fill="{col}"/>')
+        leg.append(_t(lx + 10 + i * 140, ly, lab, 11, COL["muted"]))
+    leg.append(f'<rect x="{lx + 570}" y="{ly - 11}" width="22" height="12" rx="2" fill="#FAFBFC" stroke="{COL["ghost"]}" stroke-dasharray="4 3"/>')
+    leg.append(_t(lx + 598, ly, "not built yet", 11, COL["muted"]))
     if title:
-        out.append(_t(W - 16, H - 14, title, 12, COL["muted"], anchor="end"))
-    out.append("</svg>")
-    return "".join(out)
+        leg.append(_t(W - 16, ly, title, 11, COL["muted"], anchor="end"))
+
+    head = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" style="background:#fff">'
+            '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse">'
+            '<path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker></defs>')
+    return head + "".join(back + mid + front + leg) + "</svg>"

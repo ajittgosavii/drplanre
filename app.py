@@ -37,7 +37,7 @@ def dur(m):
 
 def show_svg(svg):
     b64 = base64.b64encode(svg.encode()).decode()
-    st.markdown(f'<img src="data:image/svg+xml;base64,{b64}" style="width:100%"/>', unsafe_allow_html=True)
+    st.markdown(f'<div style="text-align:center"><img src="data:image/svg+xml;base64,{b64}" style="width:100%;max-height:78vh;border:1px solid #E3E8EE;border-radius:10px"/></div>', unsafe_allow_html=True)
 
 
 @st.cache_data(show_spinner=False)
