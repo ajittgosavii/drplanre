@@ -1,7 +1,8 @@
 """SVG diagram of a simulator state, with an optional highlighted probe path."""
 from html import escape
 
-W, H = 1200, 800
+W, H = 1200, 880
+TOP = 80                                   # vendor band height
 COL = {"ink": "#1B2A41", "muted": "#7D8998", "navy": "#0B3C5D", "teal": "#0B6E79", "rust": "#C8553D", "amber": "#E9A23B",
        "green": "#2E7D32", "purple": "#5B4B8A", "prod": "#E6F2FF", "prodL": "#147EBA", "dr": "#FDF0E3", "drill": "#DFF3DA",
        "ad": "#FFF8D6", "down": "#FDECEC", "grey": "#B8C2CC"}
@@ -20,6 +21,14 @@ LAYOUT = {
         "edge": {"A": (390, 300), "B": (390, 665), "C": (1045, 665)},
         "plant": {"A": (230, 752), "B": (760, 752)}},
 }
+# shift the whole drawing down to make room for the vendor band
+for _lay in LAYOUT.values():
+    _lay["regions"] = {k: (x, y + TOP, w, h) for k, (x, y, w, h) in _lay["regions"].items()}
+    for _g in ("tgw", "edge", "plant"):
+        _lay[_g] = {k: (x, y + TOP) for k, (x, y) in _lay[_g].items()}
+    _lay["vpc"] = {k: (x, y + TOP, w) for k, (x, y, w) in _lay["vpc"].items()}
+LAYOUT[1]["vendor"] = {"V1": (300, 42), "V2": (600, 42), "V3": (900, 42)}
+LAYOUT[2]["vendor"] = {"V1": (130, 42), "V2": (390, 42), "V3": (650, 42)}
 FILL = {"prod": (COL["prod"], COL["prodL"]), "mirror": (COL["dr"], COL["rust"]), "bubble": (COL["drill"], COL["green"]),
         "dr": (COL["dr"], COL["amber"]), "ad": (COL["ad"], "#B58B00")}
 DOT = {"running": COL["green"], "stopped": COL["muted"], "down": COL["rust"]}
@@ -50,6 +59,8 @@ def centers(st):
         c["edge-" + k] = p
     for k, p in lay["plant"].items():
         c["plant-" + k] = p
+    for k, p in lay["vendor"].items():
+        c["vendor-" + k] = p
     return c
 
 
@@ -88,6 +99,14 @@ def svg(st, path=None, added_targets=(), title=""):
                 k = tg["region"]
                 (x1, y1), (x2, y2) = cen[t], cen["edge-" + k]
                 out.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2 - 22}" stroke="{COL["grey"]}" stroke-width="3"/>')
+    # vendor VPN tunnels
+    for t, tg in st["tgws"].items():
+        for a, v in tg["atts"].items():
+            if v["type"] == "vpn":
+                (x1, y1), (x2, y2) = cen["vendor-" + v["vendor"]], cen[t]
+                up = st["regions"][tg["region"]]["up"]
+                out.append(f'<line x1="{x1}" y1="{y1 + 20}" x2="{x2}" y2="{y2}" stroke="{COL["purple"] if up else COL["rust"]}" stroke-width="1.6" '
+                           f'stroke-dasharray="3 4" opacity="{0.55 if up else 0.4}"/>')
     # plants to edges
     for pk, (px, py) in lay["plant"].items():
         for ek in lay["edge"]:
@@ -130,10 +149,14 @@ def svg(st, path=None, added_targets=(), title=""):
         if k not in st["regions"] or not st["edges"].get(k):
             continue
         up = st["regions"][k]["up"]
-        out.append(f'<rect x="{cx - 95}" y="{cy - 22}" width="190" height="44" rx="8" fill="{"#F4F6F9" if up else COL["down"]}" stroke="{COL["muted"]}" stroke-width="1.5"/>')
+        hh = 62 if st["fw"].get(k, {}).get("nat") else 44
+        out.append(f'<rect x="{cx - 105}" y="{cy - 22}" width="210" height="{hh}" rx="8" fill="{"#F4F6F9" if up else COL["down"]}" stroke="{COL["muted"]}" stroke-width="1.5"/>')
         out.append(_t(cx, cy - 3, f"Palo Alto + SD-WAN {k}", 13, COL["ink"], "bold", "middle"))
-        rules = ", ".join(c for c in st["fw"].get(k, []) if c.endswith("/24")) or "no PLC rules"
-        out.append(_t(cx, cy + 14, "plant rules: " + rules, 10, COL["muted"], anchor="middle"))
+        fw = st["fw"].get(k, {"plants": [], "nat": {}})
+        rules = ", ".join(c for c in fw["plants"] if c.startswith("10.") and c.endswith("/24")) or "-"
+        out.append(_t(cx, cy + 14, "PLC rules: " + rules, 10, COL["muted"], anchor="middle"))
+        if fw["nat"]:
+            out.append(_t(cx, cy + 32, "DNAT " + ", ".join(sorted(fw["nat"])), 10, COL["purple"], "bold", "middle"))
     # vpcs
     for v, vv in st["vpcs"].items():
         if v not in lay["vpc"]:
@@ -154,6 +177,14 @@ def svg(st, path=None, added_targets=(), title=""):
             out.append(f'<circle cx="{x + 16}" cy="{yy - 4}" r="5.5" fill="{col}"/>')
             out.append(_t(x + 28, yy, hh["name"], 12, COL["ink"], "bold"))
             out.append(_t(x + w - 10, yy, f'{hh["ip"]}  {hh["state"]}', 11, COL["muted"], anchor="end"))
+    # vendors
+    for k, (cx, cy) in lay["vendor"].items():
+        if k not in st["vendors"]:
+            continue
+        v = st["vendors"][k]
+        out.append(f'<rect x="{cx - 115}" y="{cy - 24}" width="230" height="46" rx="8" fill="#F3EFFA" stroke="{COL["purple"]}" stroke-width="1.6"/>')
+        out.append(_t(cx, cy - 6, f'{v["label"]} - {v["how"]}', 13, COL["purple"], "bold", "middle"))
+        out.append(_t(cx, cy + 12, v["cidr"] + ("  ->  DNAT ranges" if "DNAT" in v["how"] else "  ->  servers + PLCs"), 11, COL["muted"], anchor="middle"))
     # plants
     for k, (cx, cy) in lay["plant"].items():
         out.append(f'<rect x="{cx - 120}" y="{cy - 20}" width="240" height="40" rx="8" fill="#FFFFFF" stroke="{COL["navy"]}" stroke-width="1.6"/>')

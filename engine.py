@@ -3,13 +3,17 @@
 The state is a plain dict so a step can be replayed by deep-copying it. Routing follows AWS Transit Gateway rules:
 a packet entering a TGW through an attachment is looked up in the route table associated with that attachment,
 longest prefix wins, and static routes across a peering stay in place even when the peer Region is down.
-SD-WAN picks the edge that advertises the most specific prefix (ties: an edge whose route ends in a local VPC,
-then the plant's home Region). Paths are forward-only; every probe is one direction.
+SD-WAN (plants) and BGP VPNs (vendors) pick the TGW that advertises the most specific prefix (ties: a route that ends
+in that Region, then the home / first Region). A Palo Alto is a TGW attachment: it applies 1:1 destination NAT for the
+ranges it holds, then the packet is looked up again in the firewall's route table. Paths are forward-only; round trips
+are two probes.
 """
 import copy
 import ipaddress
 
 PLANTS = "172.16.0.0/16"
+NAT_SPACE = "100.64.0.0/10"
+ORDER = {"A": 0, "B": 1, "C": 2}
 
 
 def net(c):
@@ -23,12 +27,16 @@ def contains(cidr, ip):
 # ---------------------------------------------------------------- building blocks
 def new_state(option):
     return {"option": option, "regions": {}, "tgws": {}, "vpcs": {}, "hosts": [], "fw": {}, "edges": {},
-            "flags": {}, "clock": 0}
+            "vendors": {}, "flags": {}}
 
 
 def add_region(st, key, name):
     st["regions"][key] = {"name": name, "up": True}
-    st["fw"].setdefault(key, [])
+    st["fw"].setdefault(key, {"plants": [], "vendors": [], "nat": {}})
+
+
+def add_vendor(st, key, label, cidr, ip, how):
+    st["vendors"][key] = {"label": label, "cidr": cidr, "ip": ip, "how": how}
 
 
 def add_tgw(st, name, region, default_assoc=True, default_prop=True, assoc_rt="spoke", prop_rts=("spoke",), rts=("spoke",)):
@@ -74,10 +82,15 @@ def associate(st, tgw, att, rt):
 def propagate(st, tgw, att, rt):
     a = st["tgws"][tgw]["atts"][att]
     if a["type"] == "vpc":
-        for c in st["vpcs"][a["vpc"]]["cidrs"]:
-            add_route(st, tgw, rt, c, att, "propagated")
+        cidrs = st["vpcs"][a["vpc"]]["cidrs"]
     elif a["type"] == "sdwan":
-        add_route(st, tgw, rt, PLANTS, att, "propagated")
+        cidrs = [PLANTS]
+    elif a["type"] == "vpn":
+        cidrs = [st["vendors"][a["vendor"]]["cidr"]]
+    else:
+        cidrs = []
+    for c in cidrs:
+        add_route(st, tgw, rt, c, att, "propagated")
 
 
 def unpropagate(st, tgw, att, rt=None):
@@ -87,10 +100,10 @@ def unpropagate(st, tgw, att, rt=None):
         r["routes"][:] = [x for x in r["routes"] if not (x["target"] == att and x["kind"] == "propagated")]
 
 
-def attach(st, tgw, att, vpc=None, kind="vpc", peer=None, assoc=None, prop=None):
+def attach(st, tgw, att, vpc=None, kind="vpc", peer=None, assoc=None, prop=None, vendor=None):
     """Create an attachment. assoc / prop None = the TGW's defaults decide (the real-world trap)."""
     t = st["tgws"][tgw]
-    t["atts"][att] = {"type": kind, "vpc": vpc, "peer": peer}
+    t["atts"][att] = {"type": kind, "vpc": vpc, "peer": peer, "vendor": vendor}
     if vpc:
         st["vpcs"][vpc]["att"] = (tgw, att)
     if assoc is None and t["default_assoc"]:
@@ -123,6 +136,11 @@ def region_up(st, key, start_hosts=False):
             h["state"] = "running" if start_hosts else "stopped"
 
 
+def split_halves(cidr):
+    """The two more-specific halves of a prefix - lets a cutover ADD routes over a same-length route instead of replacing it."""
+    return [str(n) for n in net(cidr).subnets(prefixlen_diff=1)]
+
+
 # ---------------------------------------------------------------- lookups
 def lpm(routes, ip):
     best = None
@@ -143,109 +161,166 @@ def tgw_up(st, tgw):
     return st["regions"][st["tgws"][tgw]["region"]]["up"]
 
 
+def tgw_of_region(st, reg):
+    return next((t for t, v in st["tgws"].items() if v["region"] == reg), None)
+
+
 def sdwan_rt(st, tgw):
     t = st["tgws"][tgw]
     att = next((a for a, v in t["atts"].items() if v["type"] == "sdwan"), None)
     return att, (rt_of(st, tgw, att) if att else None)
 
 
-def sdwan_choice(st, ip, site_region):
-    """Which Region's SD-WAN edge the plants use for ip: (score, region, tgw, prefix) or None."""
-    best = None
+def _ingresses(st, kind, key):
+    """(tgw, attachment) pairs through which plants (kind=plant) or a vendor (kind=vendor) can enter AWS."""
+    out = []
     for tgw, t in st["tgws"].items():
-        reg = t["region"]
-        if not st["edges"].get(reg) or not tgw_up(st, tgw):
+        if not tgw_up(st, tgw):
             continue
-        att, rt = sdwan_rt(st, tgw)
+        for a, v in t["atts"].items():
+            if kind == "plant" and v["type"] == "sdwan" and st["edges"].get(t["region"]):
+                out.append((tgw, a))
+            if kind == "vendor" and v["type"] == "vpn" and v["vendor"] == key:
+                out.append((tgw, a))
+    return out
+
+
+def ingress_choice(st, ip, kind, key, home=None):
+    """Best entry for ip: (score, region, tgw, attachment, prefix) or None. Most specific advert wins, then a route that
+    ends in that Region, then the home Region, then the first Region."""
+    best = None
+    for tgw, att in _ingresses(st, kind, key):
+        t = st["tgws"][tgw]
+        rt = rt_of(st, tgw, att)
         if not rt:
             continue
-        adv = [r for r in t["rts"][rt]["routes"] if r["target"] != att]
+        skip = "sdwan" if kind == "plant" else "vpn"
+        adv = [r for r in t["rts"][rt]["routes"] if t["atts"][r["target"]]["type"] != skip]
         m = lpm(adv, ip)
         if not m:
             continue
-        local = t["atts"][m["target"]]["type"] == "vpc"
-        score = (net(m["cidr"]).prefixlen, local, reg == site_region)
+        reg = t["region"]
+        local = t["atts"][m["target"]]["type"] != "peering"
+        score = (net(m["cidr"]).prefixlen, local, reg == home, -ORDER[reg])
         if best is None or score > best[0]:
-            best = (score, reg, tgw, m["cidr"])
+            best = (score, reg, tgw, att, m["cidr"])
     return best
 
 
-def advertised(st, tgw):
-    """Prefixes the SD-WAN edge of this TGW advertises to the plants."""
-    att, rt = sdwan_rt(st, tgw)
-    if not rt or not st["edges"].get(st["tgws"][tgw]["region"]):
-        return []
-    return sorted({r["cidr"] for r in st["tgws"][tgw]["rts"][rt]["routes"] if r["target"] != att}, key=lambda c: (net(c).prefixlen, c))
+def advertised(st, tgw, kind="plant", key=None):
+    """Prefixes this TGW advertises to the plants (SD-WAN) or to a vendor (its VPN)."""
+    t = st["tgws"][tgw]
+    for t_, att in _ingresses(st, kind, key):
+        if t_ != tgw:
+            continue
+        rt = rt_of(st, tgw, att)
+        skip = "sdwan" if kind == "plant" else "vpn"
+        return sorted({r["cidr"] for r in t["rts"][rt]["routes"] if t["atts"][r["target"]]["type"] != skip},
+                      key=lambda c: (net(c).prefixlen, c))
+    return []
 
 
-def _deliver(st, vpc, ip, hops, text):
+def _res(ok, reason, hops, text, **kw):
+    d = {"ok": ok, "reason": reason, "hops": hops, "path": text, "firewalls": [], "dnat": None}
+    d.update(kw)
+    return d
+
+
+def _deliver(st, vpc, ip, hops, text, ctx):
     v = st["vpcs"][vpc]
     hops.append(vpc)
     if not st["regions"][v["region"]]["up"]:
-        return {"ok": False, "hops": hops, "path": text, "reason": f"{v['label']} is in a Region that is down"}
+        return _res(False, f"{v['label']} is in a Region that is down", hops, text, **ctx)
     hs = [h for h in st["hosts"] if h["vpc"] == vpc and h["ip"] == ip]
     run = [h for h in hs if h["state"] == "running"]
     if run:
         h = run[0]
         what = f"DR copy of {h['copy_of']}" if h["copy_of"] else h["name"]
         text.append(f"delivered to {what} ({ip})")
-        return {"ok": True, "hops": hops, "path": text, "reason": f"served by {what} in {v['label']}", "served_by": h["name"]}
+        return _res(True, f"served by {what} in {v['label']}", hops, text, served_by=h["name"], served_vpc=vpc, **ctx)
     if hs:
-        return {"ok": False, "hops": hops, "path": text, "reason": f"{hs[0]['name']} in {v['label']} is {hs[0]['state']}"}
+        return _res(False, f"{hs[0]['name']} in {v['label']} is {hs[0]['state']}", hops, text, **ctx)
     if v["kind"] == "mirror":
-        return {"ok": False, "hops": hops, "path": text, "reason": f"traffic arrives in the EMPTY {v['label']} - nothing runs there"}
-    return {"ok": False, "hops": hops, "path": text, "reason": f"no server with {ip} in {v['label']}"}
+        return _res(False, f"traffic arrives in the EMPTY {v['label']} - nothing runs there", hops, text, **ctx)
+    return _res(False, f"no server with {ip} in {v['label']}", hops, text, **ctx)
 
 
 def send(st, src, ip):
-    """src = ("vpc", name) or ("plant", region_key). Returns ok, hops (diagram node ids), path text, reason."""
+    """src = ("vpc", name) | ("plant", region_key) | ("vendor", vendor_key).
+    Returns ok, reason, hops (diagram node ids), path text, firewalls traversed, dnat (Region that translated)."""
     hops, text = [], []
-    if src[0] == "plant":
-        hops.append("plant-" + src[1])
-        ch = sdwan_choice(st, ip, src[1])
+    ctx = {"firewalls": [], "dnat": None}
+    if src[0] in ("plant", "vendor"):
+        kind, key = src
+        hops.append(f"{kind}-{key}")
+        ch = ingress_choice(st, ip, kind, key, home=key if kind == "plant" else None)
+        who = "SD-WAN" if kind == "plant" else f"{st['vendors'][key]['label']} VPN"
         if not ch:
-            return {"ok": False, "hops": hops, "path": text, "reason": "SD-WAN has no route to " + ip}
-        _, reg, tgw, prefix = ch
+            return _res(False, f"{who} has no route to {ip}", hops, text, **ctx)
+        _, reg, tgw, att, prefix = ch
         hops.append("edge-" + reg)
-        text.append(f"SD-WAN -> {st['regions'][reg]['name']} edge (best advert {prefix})")
-        if not any(contains(c, ip) for c in st["fw"].get(reg, [])):
-            return {"ok": False, "hops": hops, "path": text, "reason": f"Palo Alto {st['regions'][reg]['name']}: no rule for plants -> {ip} (dropped)"}
+        text.append(f"{who} -> {st['regions'][reg]['name']} (best advert {prefix})")
+        rules = st["fw"][reg]["plants" if kind == "plant" else "vendors"]
+        if not any(contains(c, ip) for c in rules):
+            src_lbl = "plants" if kind == "plant" else st["vendors"][key]["label"]
+            return _res(False, f"Palo Alto {st['regions'][reg]['name']}: no rule for {src_lbl} -> {ip} (dropped)", hops, text, **ctx)
         text.append(f"Palo Alto {st['regions'][reg]['name']} allows")
-        cur_tgw, cur_att = tgw, sdwan_rt(st, tgw)[0]
+        cur_tgw, cur_att = tgw, att
     else:
         vpc = st["vpcs"][src[1]]
         hops.append(src[1])
         if not st["regions"][vpc["region"]]["up"]:
-            return {"ok": False, "hops": hops, "path": text, "reason": f"source {vpc['label']} is down"}
+            return _res(False, f"source {vpc['label']} is down", hops, text, **ctx)
         if any(contains(c, ip) for c in vpc["cidrs"]):
-            return _deliver(st, src[1], ip, hops[:-1], ["local VPC route"])
+            return _deliver(st, src[1], ip, hops[:-1], ["local VPC route"], ctx)
         if not vpc["att"]:
-            return {"ok": False, "hops": hops, "path": text, "reason": f"{vpc['label']} is not attached to any TGW - no path out (isolated)"}
+            return _res(False, f"{vpc['label']} is not attached to any TGW - no path out (isolated)", hops, text, **ctx)
         cur_tgw, cur_att = vpc["att"]
-    for _ in range(8):
+    for _ in range(14):
         hops.append(cur_tgw)
         if not tgw_up(st, cur_tgw):
-            return {"ok": False, "hops": hops, "path": text, "reason": f"{cur_tgw} is in a Region that is down"}
+            return _res(False, f"{cur_tgw} is in a Region that is down", hops, text, **ctx)
         rt = rt_of(st, cur_tgw, cur_att)
         if not rt:
-            return {"ok": False, "hops": hops, "path": text, "reason": f"{cur_tgw}: attachment {cur_att} has no route-table association"}
+            return _res(False, f"{cur_tgw}: attachment {cur_att} has no route-table association", hops, text, **ctx)
         m = lpm(st["tgws"][cur_tgw]["rts"][rt]["routes"], ip)
         if not m:
-            return {"ok": False, "hops": hops, "path": text, "reason": f"{cur_tgw} table '{rt}': no route to {ip} (blackhole)"}
+            return _res(False, f"{cur_tgw} table '{rt}': no route to {ip} (blackhole)", hops, text, **ctx)
         text.append(f"{cur_tgw} [{rt}] {m['cidr']} -> {m['target']}" + (" (propagated)" if m["kind"] == "propagated" else ""))
         a = st["tgws"][cur_tgw]["atts"][m["target"]]
         if a["type"] == "vpc":
-            return _deliver(st, a["vpc"], ip, hops, text)
+            return _deliver(st, a["vpc"], ip, hops, text, ctx)
         if a["type"] == "sdwan":
             hops.append("edge-" + st["tgws"][cur_tgw]["region"])
             ok = contains(PLANTS, ip)
-            return {"ok": ok, "hops": hops, "path": text, "reason": "delivered to the plants" if ok else "sent to SD-WAN, unknown destination"}
+            return _res(ok, "delivered to the plants over SD-WAN" if ok else "sent to SD-WAN, unknown destination", hops, text, **ctx)
+        if a["type"] == "vpn":
+            v = st["vendors"][a["vendor"]]
+            hops.append("vendor-" + a["vendor"])
+            ok = contains(v["cidr"], ip)
+            return _res(ok, f"delivered to {v['label']} over its VPN" if ok else f"sent to {v['label']} VPN, wrong destination", hops, text, **ctx)
+        if a["type"] == "firewall":
+            reg = st["tgws"][cur_tgw]["region"]
+            hops.append("edge-" + reg)
+            fw = st["fw"][reg]
+            ctx["firewalls"].append(reg)
+            nat = next(((nc, real) for nc, real in fw["nat"].items() if contains(nc, ip)), None)
+            if nat:
+                new = str(net(nat[1]).network_address + (int(ipaddress.ip_address(ip)) - int(net(nat[0]).network_address)))
+                text.append(f"Palo Alto {st['regions'][reg]['name']} DNAT {ip} -> {new}")
+                ip, ctx["dnat"] = new, reg
+            elif contains(NAT_SPACE, ip):
+                return _res(False, f"Palo Alto {st['regions'][reg]['name']}: no DNAT rule for {ip} (dropped)", hops, text, **ctx)
+            else:
+                text.append(f"Palo Alto {st['regions'][reg]['name']} inspects")
+            cur_att = m["target"]            # re-enter the same TGW from the firewall attachment
+            continue
         nxt_tgw, nxt_att = a["peer"]
         if not tgw_up(st, nxt_tgw):
             hops.append(nxt_tgw)
-            return {"ok": False, "hops": hops, "path": text, "reason": f"peering {m['target']}: the peer Region is down - static route still points there (blackhole)"}
+            return _res(False, f"peering {m['target']}: the peer Region is down - static route still points there (blackhole)", hops, text, **ctx)
         cur_tgw, cur_att = nxt_tgw, nxt_att
-    return {"ok": False, "hops": hops, "path": text, "reason": "routing loop"}
+    return _res(False, "routing loop", hops, text, **ctx)
 
 
 # ---------------------------------------------------------------- snapshots / diffs

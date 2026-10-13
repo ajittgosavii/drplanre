@@ -17,6 +17,16 @@ APP = {"A": "APPA01", "B": "APPB01"}
 IP = {"SQLA01": "10.10.1.20", "APPA01": "10.10.1.10", "SQLB01": "10.20.1.20", "APPB01": "10.20.1.10"}
 DC = {"A": ("DCA01", "10.10.50.10"), "B": ("DCB01", "10.20.50.10"), "C": ("DCC01", "10.30.16.10")}
 OTHER = {"A": "B", "B": "A"}
+# vendors: V1 / V2 = BGP S2S VPN into the TGW of BOTH Regions, reach PLC-facing servers and the plants' PLCs over SD-WAN;
+#          V3 = BGP S2S VPN into both TGWs, reaches the servers only through private 1:1 DNAT ranges on the Palo Altos
+VENDORS = {"V1": ("Vendor 1", "192.168.10.0/24", "192.168.10.10", "S2S VPN"),
+           "V2": ("Vendor 2", "192.168.20.0/24", "192.168.20.10", "S2S VPN"),
+           "V3": ("Vendor 3", "192.168.30.0/24", "192.168.30.10", "S2S VPN + DNAT")}
+NAT = {"A": "100.64.10.0/24", "B": "100.64.20.0/24"}             # vendor-3 DNAT range -> PLC subnet, 1:1
+NATIP = {"SQLA01": "100.64.10.20", "SQLB01": "100.64.20.20"}
+PLANT_PLC = {"A": "172.16.1.50", "B": "172.16.2.50"}
+VCIDR = {k: v[1] for k, v in VENDORS.items()}
+PROD_RTS = ("spoke", "sdwan", "peering", "vpn", "fw")
 
 
 def step(title, actor, minutes, text, fn=None, commands=(), checks=(), risk=None, phase=None):
@@ -29,6 +39,8 @@ def prod(option):
     st = E.new_state(option)
     for k in ("A", "B") + (("C",) if option == 2 else ()):
         E.add_region(st, k, REG[k])
+    for v, (label, cidr, ip, how) in VENDORS.items():
+        E.add_vendor(st, v, label, cidr, ip, how)
     for k in ("A", "B"):
         o = "10.10" if k == "A" else "10.20"
         E.add_vpc(st, "VPC-" + k, k, [VPCR[k]], "prod", f"Production VPC {k}")
@@ -37,16 +49,24 @@ def prod(option):
         E.add_host(st, "RPT" + k + "01", f"{o}.5.10", "VPC-" + k, "client")
         E.add_host(st, DC[k][0], DC[k][1], "VPC-" + k, "dc")
         t = "TGW-" + k
-        E.add_tgw(st, t, k, default_assoc=True, default_prop=True, assoc_rt="spoke",
-                  prop_rts=("spoke", "sdwan", "peering"), rts=("spoke", "sdwan", "peering"))
+        E.add_tgw(st, t, k, default_assoc=True, default_prop=True, assoc_rt="spoke", prop_rts=PROD_RTS, rts=PROD_RTS)
         E.attach(st, t, "vpc-" + k, vpc="VPC-" + k)
-        E.attach(st, t, "sdwan-" + k, kind="sdwan", assoc="sdwan", prop=["spoke", "peering"])
+        E.attach(st, t, "sdwan-" + k, kind="sdwan", assoc="sdwan", prop=["spoke", "peering", "vpn", "fw"])
+        E.attach(st, t, "fw-" + k, kind="firewall", assoc="fw", prop=[])
+        for v in ("V1", "V2"):
+            E.attach(st, t, f"vpn-{v}-{k}", kind="vpn", vendor=v, assoc="vpn", prop=["spoke", "sdwan", "peering", "fw"])
+        E.attach(st, t, f"vpn-V3-{k}", kind="vpn", vendor="V3", assoc="vpn", prop=["peering", "fw"])
+        E.add_route(st, t, "spoke", VCIDR["V3"], "fw-" + k)          # vendor-3 replies return through the DNAT firewall
+        E.add_route(st, t, "vpn", NAT[k], "fw-" + k)                 # own DNAT range -> own Palo Alto
+        E.add_route(st, t, "peering", NAT[k], "fw-" + k)
         st["edges"][k] = True
-        st["fw"][k] = [VPCR[k]]
+        st["fw"][k] = {"plants": [VPCR[k], VCIDR["V1"], VCIDR["V2"]], "vendors": [VPCR[k], E.PLANTS, "100.64.0.0/16"],
+                       "nat": {NAT[k]: PLC[k]}}
     E.peer(st, "TGW-A", "TGW-B", "peer-AB", "peering", "peering")
     for k in ("A", "B"):
-        for rt in ("spoke", "sdwan"):
+        for rt in ("spoke", "sdwan", "vpn", "fw"):
             E.add_route(st, "TGW-" + k, rt, VPCR[OTHER[k]], "peer-AB")
+        E.add_route(st, "TGW-" + k, "vpn", NAT[OTHER[k]], "peer-AB")
     if option == 2:
         st["edges"]["C"] = False
     return st
@@ -119,14 +139,19 @@ def rollout(option, whatif=frozenset()):
                       ["DR readiness READY in both directions"], phase="Build"))
         def s8(st):
             if "no_fw" not in whatif:
-                st["fw"]["B"].append(PLC["A"])
-                st["fw"]["A"].append(PLC["B"])
+                for k in ("A", "B"):
+                    r = OTHER[k]
+                    st["fw"][r]["plants"].append(PLC[k])
+                    st["fw"][r]["vendors"].append(PLC[k])
+                    st["fw"][r]["nat"][NAT[k]] = PLC[k]
             st["flags"].update(cutover_approved=True)
         S.append(step("Stage 8 - Firewall / SD-WAN pre-staging + pre-approved cutover", "Interface + Network + CAB", 10 * 480,
-                      "Palo Alto in each Region gets rules for the OTHER Region's PLC flows (same addresses, carry no traffic yet). SD-WAN route learning confirmed. "
+                      "Palo Alto in each Region gets rules for the OTHER Region's PLC flows - plants AND vendors 1/2 - plus vendor 3's DNAT rules for the other Region's NAT range "
+                      "(same translations: the servers keep their IPs). They carry no traffic yet. SD-WAN route learning and vendor BGP confirmed. "
                       "The cutover / rollback route commands are registered as a pre-approved standard change." +
                       (" WHAT-IF: the firewall rules were NOT pre-staged." if "no_fw" in whatif else ""), s8,
-                      ["dr_engine.py cutover-plan --direction us-east-1->us-west-2", "dr_engine.py cutover-plan --direction us-west-2->us-east-1"],
+                      ["Panorama: pre-stage plants + vendor 1/2 rules for the other Region's PLC subnet; DNAT 100.64.x.0/24 -> PLC subnet (both Regions)",
+                       "dr_engine.py cutover-plan --direction us-east-1->us-west-2", "dr_engine.py cutover-plan --direction us-west-2->us-east-1"],
                       ["Rules + route learning confirmed in writing", "Standard change approved"], phase="Build"))
     else:
         def s1(st):
@@ -137,8 +162,8 @@ def rollout(option, whatif=frozenset()):
                       "Nothing touches production.", s1, ["Account Factory: new account 'DR'", "aws cloudformation deploy --stack-name dr-vpc ..."],
                       ["Account governed, DR VPC created"], phase="Build"))
         def s2(st):
-            E.add_tgw(st, "TGW-C", "C", default_assoc=False, default_prop=False, assoc_rt="dr", prop_rts=(), rts=("dr", "peering", "sdwan"))
-            E.attach(st, "TGW-C", "vpc-DR", vpc="DR-C", assoc="dr", prop=["dr", "peering", "sdwan"])
+            E.add_tgw(st, "TGW-C", "C", default_assoc=False, default_prop=False, assoc_rt="dr", prop_rts=(), rts=("dr", "peering", "sdwan", "fw"))
+            E.attach(st, "TGW-C", "vpc-DR", vpc="DR-C", assoc="dr", prop=["dr", "peering", "sdwan", "fw"])
             E.peer(st, "TGW-A", "TGW-C", "peer-AC", "peering", "peering")
             E.peer(st, "TGW-B", "TGW-C", "peer-BC", "peering", "peering")
             E.add_route(st, "TGW-C", "dr", VPCR["A"], "peer-AC")
@@ -154,16 +179,27 @@ def rollout(option, whatif=frozenset()):
                        f"aws ec2 create-transit-gateway-route --destination-cidr-block {DR_SUMMARY} --transit-gateway-attachment-id <peer-AC|peer-BC>"],
                       ["supernet-of / subnet-of searches for DR-C were EMPTY before", "Baseline A<->B and plant tests still pass"], risk="MEDIUM", phase="Build"))
         def s3(st):
-            E.attach(st, "TGW-C", "sdwan-C", kind="sdwan", assoc="sdwan", prop=["dr", "peering"])
+            E.attach(st, "TGW-C", "sdwan-C", kind="sdwan", assoc="sdwan", prop=["dr", "peering", "fw"])
+            E.attach(st, "TGW-C", "fw-C", kind="firewall", assoc="fw", prop=[])
+            E.add_route(st, "TGW-C", "dr", VCIDR["V3"], "fw-C")          # vendor-3 replies via the DNAT firewall
+            for k in ("A", "B"):
+                E.add_route(st, "TGW-C", "peering", NAT[k], "fw-C")      # harmless until a cutover sends NAT traffic here
             st["edges"]["C"] = True
-            st["fw"]["C"] = [DR_SUMMARY] + ([] if "no_fw" in whatif else [PLC["A"], PLC["B"]])
+            st["fw"]["C"] = {"plants": [DR_SUMMARY], "vendors": [], "nat": {}}
+            if "no_fw" not in whatif:
+                for k in ("A", "B"):
+                    st["fw"]["C"]["plants"].append(PLC[k])
+                    st["fw"]["C"]["nat"][NAT[k]] = PLC[k]
+                    st["fw"][OTHER[k]]["vendors"].append(PLC[k])         # vendors enter via the SURVIVING production Region
         S.append(step("Stage 3 - Palo Alto + SD-WAN edge in us-east-2", "Interface team", 18 * 480,
-                      "Inspection VPC (appliance mode) and an SD-WAN edge in us-east-2. Rules for replication AND - pre-staged - plants <-> PLC-A and plants <-> PLC-B. "
-                      "They carry no traffic until a cutover." + (" WHAT-IF: the PLC rules were NOT pre-staged." if "no_fw" in whatif else ""), s3,
-                      ["Panorama: pre-stage rules plants <-> 10.10.1.0/24, 10.20.1.0/24 (both directions)"], ["SD-WAN learns TGW-C routes by BGP - confirmed in writing"], phase="Build"))
+                      "Inspection VPC (appliance mode) and an SD-WAN edge in us-east-2. Rules for replication AND - pre-staged - plants <-> PLC-A / PLC-B and vendor 3's DNAT "
+                      "for both NAT ranges. Vendors have no VPN into us-east-2: at failover they come in through the SURVIVING production Region, so its Palo Alto "
+                      "also gets pre-staged vendor rules for the other Region's PLC subnet - a production-firewall change. All carry no traffic until a cutover." + (" WHAT-IF: the PLC rules were NOT pre-staged." if "no_fw" in whatif else ""), s3,
+                      ["Panorama C: plants <-> 10.10.1.0/24, 10.20.1.0/24; DNAT 100.64.10.0/24 -> 10.10.1.0/24, 100.64.20.0/24 -> 10.20.1.0/24",
+                       "Panorama A / B: vendor 1/2 -> the other Region's PLC subnet (pre-staged)"], ["SD-WAN learns TGW-C routes by BGP - confirmed in writing"], phase="Build"))
         def s4(st):
             E.add_vpc(st, "SS-C", "C", ["10.30.16.0/24"], "ad", "Shared Services (AD) us-east-2")
-            E.attach(st, "TGW-C", "vpc-SS", vpc="SS-C", assoc="dr", prop=["dr", "peering", "sdwan"])
+            E.attach(st, "TGW-C", "vpc-SS", vpc="SS-C", assoc="dr", prop=["dr", "peering", "sdwan", "fw"])
             E.add_host(st, DC["C"][0], DC["C"][1], "SS-C", "dc")
         S.append(step("Stage 4 - AWS Managed AD: add Region us-east-2", "AD team", 5 * 480,
                       "Two domain controllers in us-east-2 (replicas of the existing directory). Recovered servers will log on locally.", s4,
@@ -222,6 +258,34 @@ def ready(option, whatif=frozenset()):
 
 
 # ================================================================ failover / failback
+def cutover_routes(option, k):
+    """Pre-approved route sets for a failover of Region k: {set name: [(tgw, table, cidr, target)]}. Failback deletes the same entries."""
+    sv = OTHER[k]
+    halves = E.split_halves(NAT[k])          # /25s: ADD over the existing same-length /24 instead of replacing it
+    if option == 1:
+        t = "TGW-" + sv
+        return {f"TGW-{sv}": [(t, rt, PLC[k], "mir-" + k) for rt in ("spoke", "sdwan", "vpn", "fw")] +
+                             [(t, "vpn", h, "fw-" + sv) for h in halves]}
+    pc = "peer-" + sv + "C"
+    return {"TGW-C": [("TGW-C", rt, PLC[k], "mir-" + k) for rt in ("dr", "peering", "sdwan", "fw")] +
+                     [("TGW-C", "dr", VCIDR[v], pc) for v in ("V1", "V2")] + [("TGW-C", "fw", VCIDR["V3"], pc)],
+            f"TGW-{sv}": [("TGW-" + sv, rt, PLC[k], pc) for rt in ("spoke", "sdwan", "vpn")] +
+                         [("TGW-" + sv, "vpn", h, pc) for h in halves]}
+
+
+def _apply(routes):
+    return lambda st: [E.add_route(st, t, rt, c, tg) for t, rt, c, tg in routes]
+
+
+def _cmds(routes, verb="create"):
+    out = []
+    for t, rt, c, tg in routes:
+        reg = {"TGW-A": "us-east-1", "TGW-B": "us-west-2", "TGW-C": "us-east-2"}[t]
+        out.append(f"aws ec2 {verb}-transit-gateway-route --region {reg} --transit-gateway-route-table-id <{rt}> --destination-cidr-block {c}"
+                   + (f" --transit-gateway-attachment-id <{tg}>" if verb == "create" else ""))
+    return out
+
+
 def failover(option, k):
     """Real Region failure of k (A or B)."""
     sv = OTHER[k]
@@ -236,32 +300,24 @@ def failover(option, k):
     S.append(step("Fence the primaries", "DR team", 5, f"Any {REG[k]} primary still reachable is stopped; none may start while its copy runs (same IP, same AD computer account).",
                   lambda st: st["flags"].update(fenced=k), checks=["No primary running in PLC-" + k], phase="Fence"))
     if option == 1:
-        def cut(st):
-            for rt in ("spoke", "sdwan"):
-                E.add_route(st, "TGW-" + sv, rt, PLC[k], "mir-" + k)
+        rs = cutover_routes(1, k)[f"TGW-{sv}"]
         S.append(step(f"Cutover - one route set in TGW-{sv}", "Network team (pre-approved)", 10,
-                      f"Static {PLC[k]} -> mirror attachment in the surviving TGW's spoke and SD-WAN tables. The /24 beats the /16 to the dead peering; nothing is deleted. "
-                      f"SD-WAN learns the /24 by BGP and plants of {REG[k]} now route to {REG[sv]} (the mirror is still empty).", cut,
-                      [f"aws ec2 create-transit-gateway-route --region {REG[sv]} --transit-gateway-route-table-id <spoke|sdwan> \\",
-                       f"    --destination-cidr-block {PLC[k]} --transit-gateway-attachment-id <mir-{k}>"],
-                      ["Routes visible in both tables", f"SD-WAN learned {PLC[k]} via {REG[sv]}"], risk="HIGH*", phase="Cutover"))
+                      f"Static {PLC[k]} -> mirror attachment in the surviving TGW's spoke, SD-WAN, VPN and firewall tables: plants (SD-WAN), vendors 1/2 (VPN) and "
+                      f"vendor 3 after DNAT (firewall table) all reach the mirror. Vendor 3's NAT range {NAT[k]} is added as two /25s -> the {REG[sv]} Palo Alto - "
+                      f"more specific than the /24 to the dead peering, so nothing is replaced. The /24 beats the /16; nothing is deleted. The mirror is still empty.",
+                      _apply(rs), _cmds(rs), ["Routes visible in all four tables", f"SD-WAN and vendor BGP learned {PLC[k]} via {REG[sv]}"], risk="HIGH*", phase="Cutover"))
     else:
-        def cut1(st):
-            for rt in ("dr", "peering", "sdwan"):
-                E.add_route(st, "TGW-C", rt, PLC[k], "mir-" + k)
-        def cut2(st):
-            for rt in ("spoke", "sdwan"):
-                E.add_route(st, "TGW-" + sv, rt, PLC[k], "peer-" + sv + "C")
+        rs = cutover_routes(2, k)
         S.append(step("Cutover set 1 - TGW us-east-2", "Network team (pre-approved)", 10,
-                      f"Static {PLC[k]} -> mirror attachment in TGW-C's dr, peering and sdwan tables. SD-WAN edge C advertises the /24 - plants of {REG[k]} route to us-east-2. "
-                      f"But {REG[sv]} workloads still follow the /16 to the dead peering.", cut1,
-                      [f"aws ec2 create-transit-gateway-route --region us-east-2 --transit-gateway-route-table-id <dr|peering|sdwan> \\",
-                       f"    --destination-cidr-block {PLC[k]} --transit-gateway-attachment-id <mir-{k}>"], ["Routes visible in all three TGW-C tables"], risk="HIGH*", phase="Cutover"))
+                      f"Static {PLC[k]} -> mirror attachment in TGW-C's dr, peering, sdwan and firewall tables, plus vendor return routes: vendors 1/2 -> the "
+                      f"{REG[sv]} peering, vendor 3 -> {REG[sv]} after the us-east-2 Palo Alto. Plants of {REG[k]} now route to us-east-2. "
+                      f"But {REG[sv]} workloads AND the vendors (their VPNs end in {REG[sv]}) still follow the routes to the dead peering.",
+                      _apply(rs["TGW-C"]), _cmds(rs["TGW-C"]), ["Routes visible in all TGW-C tables"], risk="HIGH*", phase="Cutover"))
         S.append(step(f"Cutover set 2 - surviving TGW-{sv}", "Network team (pre-approved)", 10,
-                      f"Static {PLC[k]} -> peering {sv}-C in TGW-{sv}'s spoke and SD-WAN tables, so {REG[sv]} workloads reach the recovered servers via us-east-2. "
-                      "This second set is what Option 1 does not need - and what the tooling does not print yet (runbook).", cut2,
-                      [f"aws ec2 create-transit-gateway-route --region {REG[sv]} --transit-gateway-route-table-id <spoke|sdwan> \\",
-                       f"    --destination-cidr-block {PLC[k]} --transit-gateway-attachment-id <peer-{sv}C>"], ["Routes visible", f"{REG[sv]} reporting probe OK"], risk="HIGH*", phase="Cutover"))
+                      f"Static {PLC[k]} -> peering {sv}-C in TGW-{sv}'s spoke, SD-WAN and VPN tables, and vendor 3's NAT range {NAT[k]} as two /25s -> peering {sv}-C "
+                      f"(DNAT happens on the us-east-2 Palo Alto, which has the same rules pre-staged). {REG[sv]} workloads and all three vendors now reach the "
+                      "recovered servers. Option 1 needs no second set - and the tooling does not print it yet (runbook).",
+                      _apply(rs[f"TGW-{sv}"]), _cmds(rs[f"TGW-{sv}"]), ["Routes visible", f"{REG[sv]} reporting probe OK", "Vendor probes OK"], risk="HIGH*", phase="Cutover"))
     mv = _mirror_name(k)
     def rec_db(st):
         E.add_host(st, SQL[k] + "-DR", IP[SQL[k]], mv, "db", copy_of=SQL[k])
@@ -295,18 +351,13 @@ def failback(option, k):
             if h["copy_of"] and h["state"] == "running":
                 h["state"] = "stopped"
     S.append(step("Change window - stop the copies", "DR team", 10, "Short planned outage starts: copies stopped so nothing runs twice.", stop_copies, phase="Window"))
+    allr = [r for rs in cutover_routes(option, k).values() for r in rs]
     def del_routes(st):
-        if option == 1:
-            for rt in ("spoke", "sdwan"):
-                E.del_route(st, "TGW-" + sv, rt, PLC[k])
-        else:
-            for rt in ("dr", "peering", "sdwan"):
-                E.del_route(st, "TGW-C", rt, PLC[k])
-            for rt in ("spoke", "sdwan"):
-                E.del_route(st, "TGW-" + sv, rt, PLC[k])
+        for t, rt, c, _ in allr:
+            E.del_route(st, t, rt, c)
     S.append(step("Delete the failover route" + ("" if option == 1 else " sets (both TGWs)"), "Network team (pre-approved)", 10,
-                  "The /24s are deleted; traffic falls back to the original Region's routes. SD-WAN withdraws the /24.", del_routes,
-                  [f"aws ec2 delete-transit-gateway-route ... --destination-cidr-block {PLC[k]}" + ("" if option == 1 else "   # TGW-C x3 and TGW-" + sv + " x2")], phase="Window"))
+                  "Every route the cutover added is deleted; traffic falls back to the original Region's routes. SD-WAN and the vendors' BGP withdraw the /24 and /25s.",
+                  del_routes, _cmds(allr, "delete"), phase="Window"))
     def start_p(st):
         E.host(st, SQL[k])["state"] = "running"
         E.host(st, APP[k])["state"] = "running"
@@ -439,6 +490,13 @@ def probes(option):
         {"id": "p6", "group": "Replication", "label": "Replication us-west-2 -> staging", "src": ("vpc", "VPC-B"), "ip": stg["B"], "expect": "deliver", "needs_flag": "agents"},
         {"id": "p7", "group": "Recovered", "label": f"Recovered PLC-A copy -> {dc_for_a[0]} (logon)", "src": ("vpc", "MIR-A"), "ip": dc_for_a[1], "expect": "deliver", "needs_copy": "MIR-A"},
         {"id": "p8", "group": "Recovered", "label": f"Recovered PLC-B copy -> {dc_for_b[0]} (logon)", "src": ("vpc", "MIR-B"), "ip": dc_for_b[1], "expect": "deliver", "needs_copy": "MIR-B"},
+        {"id": "v1", "group": "Vendors", "label": "Vendor 1 (VPN) -> SQLA01 server", "src": ("vendor", "V1"), "ip": IP["SQLA01"], "expect": "deliver"},
+        {"id": "v2", "group": "Vendors", "label": "Vendor 1 (VPN) -> east plant PLC via SD-WAN", "src": ("vendor", "V1"), "ip": PLANT_PLC["A"], "expect": "deliver"},
+        {"id": "v3", "group": "Vendors", "label": "East plant PLC -> Vendor 1 (return)", "src": ("plant", "A"), "ip": VENDORS["V1"][2], "expect": "deliver"},
+        {"id": "v4", "group": "Vendors", "label": "Vendor 2 (VPN) -> SQLB01 server", "src": ("vendor", "V2"), "ip": IP["SQLB01"], "expect": "deliver"},
+        {"id": "v5", "group": "Vendors", "label": "Vendor 2 (VPN) -> west plant PLC via SD-WAN", "src": ("vendor", "V2"), "ip": PLANT_PLC["B"], "expect": "deliver"},
+        {"id": "n1", "group": "Vendor DNAT", "label": f"Vendor 3 -> {NATIP['SQLA01']} (DNAT to SQLA01), round trip", "src": ("vendor", "V3"), "ip": NATIP["SQLA01"], "expect": "deliver", "roundtrip": True},
+        {"id": "n2", "group": "Vendor DNAT", "label": f"Vendor 3 -> {NATIP['SQLB01']} (DNAT to SQLB01), round trip", "src": ("vendor", "V3"), "ip": NATIP["SQLB01"], "expect": "deliver", "roundtrip": True},
         {"id": "d1", "group": "Drill isolation", "label": f"Drill copy -> {dc_for_a[0]} (must be blocked)", "src": ("vpc", bub), "ip": dc_for_a[1], "expect": "block", "needs_copy": bub},
         {"id": "d2", "group": "Drill isolation", "label": "Drill copy -> production SQLA01 (must be blocked)", "src": ("vpc", bub), "ip": IP["SQLA01"], "expect": "block", "needs_copy": bub},
         {"id": "d3", "group": "Drill isolation", "label": "Drill copy -> internet 1.1.1.1 (must be blocked)", "src": ("vpc", bub), "ip": "1.1.1.1", "expect": "block", "needs_copy": bub},
@@ -458,6 +516,15 @@ def run_probe(st, p):
     if p["src"][0] == "vpc" and not st["regions"][st["vpcs"][p["src"][1]]["region"]]["up"]:
         return {"status": "n/a", "reason": "source Region is down", "hops": [], "path": []}
     r = E.send(st, p["src"], p["ip"])
+    if p.get("roundtrip") and r["ok"]:
+        back = E.send(st, ("vpc", r["served_vpc"]), st["vendors"][p["src"][1]]["ip"])
+        r["path"] = r["path"] + ["-- return --"] + back["path"]
+        if not back["ok"]:
+            r.update(ok=False, reason="reply lost: " + back["reason"])
+        elif r["dnat"] not in back["firewalls"]:
+            r.update(ok=False, reason=f"asymmetric: DNAT on the {st['regions'][r['dnat']]['name']} Palo Alto but the reply bypasses it - session dropped")
+        else:
+            r["reason"] += f"; reply returns via the same {st['regions'][r['dnat']]['name']} Palo Alto"
     if p["expect"] == "deliver":
         r["status"] = "ok" if r["ok"] else "fail"
     else:

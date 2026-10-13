@@ -136,14 +136,14 @@ with tab_sim:
     show_svg(R.svg(state, res, touched, f"{OPTIONS[option]} - step {i}"))
     st.caption(f'**{p["label"]}** → {res["reason"]}' + (f'  ·  {"  →  ".join(res.get("path", []))}' if res.get("path") else ""))
 
-    t1, t2, t3, t4, t5 = st.tabs(["Traffic probes", "Route tables", "Servers", "SD-WAN adverts", "Timeline"])
+    t1, t2, t3, t4, t5 = st.tabs(["Traffic probes", "Route tables", "Servers", "SD-WAN / VPN adverts", "Timeline"])
     with t1:
         df = pd.DataFrame(rows).drop(columns=["_id", "_status"])
         st.dataframe(df, hide_index=True, width="stretch", column_config={"": st.column_config.TextColumn(width="small")})
         with st.expander("Custom route lookup"):
-            src_opts = [("plant", "A"), ("plant", "B")] + [("vpc", v) for v in state["vpcs"]]
+            src_opts = [("plant", "A"), ("plant", "B")] + [("vendor", v) for v in state["vendors"]] + [("vpc", v) for v in state["vpcs"]]
             cc = st.columns([2, 2, 1])
-            src = cc[0].selectbox("From", src_opts, format_func=lambda x: f"Plants {'east' if x[1] == 'A' else 'west'}" if x[0] == "plant" else state["vpcs"][x[1]]["label"])
+            src = cc[0].selectbox("From", src_opts, format_func=lambda x: f"Plants {'east' if x[1] == 'A' else 'west'}" if x[0] == "plant" else (state["vendors"][x[1]]["label"] if x[0] == "vendor" else state["vpcs"][x[1]]["label"]))
             dst = cc[1].text_input("To IP", "10.10.1.20")
             try:
                 rr = E.send(state, src, dst.strip())
@@ -185,7 +185,13 @@ with tab_sim:
             if adv:
                 st.markdown(f"**SD-WAN edge {state['tgws'][t]['region']}** ({state['regions'][state['tgws'][t]['region']]['name']}"
                             f"{', DOWN' if not E.tgw_up(state, t) else ''}) advertises: " + ", ".join(f"`{a}`" for a in adv))
-        st.caption("Plants pick the most specific prefix; ties go to the edge whose route ends in a local VPC, then to the plant's home Region.")
+        st.caption("Plants pick the most specific prefix; ties go to the edge whose route ends in that Region, then to the plant's home Region.")
+        st.markdown("**Vendor VPN (BGP) adverts**")
+        for vk, vv in state["vendors"].items():
+            for t in state["tgws"]:
+                adv = E.advertised(state, t, "vendor", vk)
+                if adv:
+                    st.markdown(f"{vv['label']} via **{t}** ({state['regions'][state['tgws'][t]['region']]['name']}): " + ", ".join(f"`{a}`" for a in adv))
     with t5:
         tl = pd.DataFrame([{"#": j, "": "▶" if j == i else ("✓" if j < i else ""), "Phase": m["phase"], "Step": m["title"], "Who": m["actor"],
                             "Duration": dur(m["minutes"]) if m["minutes"] else "-", "Risk": m["risk"] or ""} for j, m in enumerate(meta)])
@@ -249,11 +255,23 @@ Two production DR designs for PLC-facing servers whose IPs are hard-coded at the
 | Cutover | One static /24 route set in the surviving TGW | Two route sets: TGW-C + surviving TGW |
 | Mirror attachment | Production TGW, defaults ON - S1 window | TGW-C defaults OFF by design (R2 verify) |
 
+#### Vendor access (third parties)
+- **Vendors 1 and 2**: BGP Site-to-Site VPNs into the Transit Gateway of BOTH production Regions. They reach the PLC-facing servers in AWS and the
+  plants' PLCs over SD-WAN (and the PLCs reply over SD-WAN to the VPN).
+- **Vendor 3**: BGP VPNs into both TGWs, reaching the servers only through private 1:1 DNAT ranges (100.64.10.0/24 -> PLC-A, 100.64.20.0/24 -> PLC-B)
+  on the Palo Alto of each Region. Replies must return through the SAME Palo Alto that translated them.
+- At failover the PLC route set also goes into the TGW **VPN** and **firewall** tables; vendor 3's NAT range is added as two **/25s** (more specific than
+  the /24 to the dead peering - additive, deleted at failback); the recovery Region's Palo Alto holds the **same DNAT rules pre-staged** (servers keep their IPs).
+- Option 2: the vendors have no VPN into us-east-2, so they enter through the **surviving** production Region (second route set + pre-staged rules on
+  its Palo Alto). Alternative: give the vendors tunnels into TGW us-east-2 as well.
+
 #### How the model works
 - **Transit Gateway routing**: a packet entering a TGW is looked up in the table associated with its attachment; longest prefix wins; static routes to a peering stay even when the peer Region is down (blackhole).
 - **Propagation**: attaching a VPC to a TGW with defaults ON associates and propagates it automatically - the trap behind the mirror what-if.
 - **SD-WAN**: plants use the edge that advertises the most specific prefix; ties go to an edge whose route ends in a local VPC, then the home Region.
-- **Palo Alto**: plant traffic entering a Region needs a rule for the destination; the what-if toggle removes the pre-staged PLC rules.
+- **Palo Alto**: plant and vendor traffic entering a Region needs a rule for the destination; DNAT is a firewall attachment in each TGW (translate,
+  then route again); the what-if toggle removes the pre-staged PLC rules and DNAT rules.
+- **Vendor VPNs** use BGP: a vendor follows the most specific prefix any of its tunnels advertises.
 - **Probes** are one-direction forward paths. Return paths, AD replication, DNS and DRS internals are not modelled.
 
 Addresses (10.10/16, 10.20/16, 10.30/16), server names and durations are illustrative. The building blocks (same-IP recovery, isolated drill,

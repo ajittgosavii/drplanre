@@ -13,7 +13,7 @@ def status(st, option, pid):
 
 
 def prod_ok(st, option):
-    return all(status(st, option, p) in ("ok", "n/a") for p in ("p1", "p2", "p3", "p4", "p5", "p6"))
+    return all(status(st, option, p) in ("ok", "n/a") for p in ("p1", "p2", "p3", "p4", "p5", "p6", "v1", "v2", "v3", "v4", "v5", "n1", "n2"))
 
 
 def test_build_keeps_production_and_replicates():
@@ -86,6 +86,41 @@ def test_firewall_not_prestaged():
         end = states("Region failure - us-east-1 lost", o, frozenset({"no_fw"}))[-1]
         r = S.run_probe(end, next(x for x in S.probes(o) if x["id"] == "p1"))
         assert r["status"] == "fail" and "Palo Alto" in r["reason"], r
+
+
+def test_vendors_follow_the_cutover():
+    for o in (1, 2):
+        steps = S.failover(o, "A")
+        sts = states("Region failure - us-east-1 lost", o)
+        last_cut = max(i for i, x in enumerate(steps) if x["phase"] == "Cutover")
+        for i, st in enumerate(sts[1:last_cut + 2], 1):
+            for p in ("v2", "v3", "v4", "v5", "n2"):            # PLC access via SD-WAN and the healthy Region never breaks
+                assert status(st, o, p) == "ok", (o, i, p)
+        assert status(sts[1], o, "v1") == "fail" and status(sts[1], o, "n1") == "fail"
+        end = sts[-1]
+        r = S.run_probe(end, next(x for x in S.probes(o) if x["id"] == "n1"))
+        assert r["status"] == "ok" and r["dnat"] == ("B" if o == 1 else "C"), r   # DNAT moves to the recovery Region's Palo Alto
+        assert status(end, o, "v1") == "ok"
+
+
+def test_option2_vendors_need_set_2():
+    steps = S.failover(2, "A")
+    i = next(i for i, x in enumerate(steps) if x["title"].startswith("Cutover set 2"))
+    st = S.build(steps, S.ready(2), len(steps) - 1)
+    for t, rt, c, _ in S.cutover_routes(2, "A")["TGW-B"]:
+        S.E.del_route(st, t, rt, c)
+    assert status(st, 2, "v1") == "fail" and status(st, 2, "n1") == "fail" and status(st, 2, "p1") == "ok"
+
+
+def test_mirror_mistake_hits_vendors():
+    s1 = states("What-if - mirror attachment mistake", 1)
+    assert status(s1[1], 1, "v1") == "fail" and status(s1[1], 1, "n1") == "ok"
+
+
+def test_failback_deletes_every_cutover_route():
+    for o in (1, 2):
+        end = states("Failback - return to us-east-1", o)[-1]
+        assert S.E.route_set(end) == S.E.route_set(S.ready(o)), o
 
 
 def test_single_server():
