@@ -66,7 +66,8 @@ with st.sidebar:
     option = st.radio("Design", [1, 2], format_func=lambda o: OPTIONS[o])
     scen = st.selectbox("Scenario", list(S.SCENARIOS))
     no_fw = st.checkbox("What-if: firewall PLC rules NOT pre-staged", help="The recovery Region's Palo Alto has no rules for the failed Region's PLC subnet.")
-    whatif = ("no_fw",) if no_fw else ()
+    vb = st.checkbox("What-if: vendors pre-configured a backup peer", help="Policy-based vendor VPNs carry the other Region's selectors on a backup peer (DPD), so they move tunnels on their own.")
+    whatif = tuple(x for x, on in (("no_fw", no_fw), ("vendor_backup", vb)) if on)
 
 meta, states = load(scen, option, whatif)
 n = len(meta)
@@ -186,8 +187,14 @@ with tab_sim:
                 st.markdown(f"**SD-WAN edge {state['tgws'][t]['region']}** ({state['regions'][state['tgws'][t]['region']]['name']}"
                             f"{', DOWN' if not E.tgw_up(state, t) else ''}) advertises: " + ", ".join(f"`{a}`" for a in adv))
         st.caption("Plants pick the most specific prefix; ties go to the edge whose route ends in that Region, then to the plant's home Region.")
-        st.markdown("**Vendor VPN (BGP) adverts**")
+        st.markdown("**Policy-based VPN selectors** (destination -> tunnel Region, in order)")
         for vk, vv in state["vendors"].items():
+            if vv["mode"] == "policy":
+                st.markdown(f"{vv['label']}: " + ", ".join(f"`{c}` -> {' then '.join(state['regions'][r]['name'] for r in regs)}" for c, regs in vv["sel"].items()))
+        st.markdown("**BGP VPN adverts**")
+        for vk, vv in state["vendors"].items():
+            if vv["mode"] != "bgp":
+                continue
             for t in state["tgws"]:
                 adv = E.advertised(state, t, "vendor", vk)
                 if adv:
@@ -256,10 +263,13 @@ Two production DR designs for PLC-facing servers whose IPs are hard-coded at the
 | Mirror attachment | Production TGW, defaults ON - S1 window | TGW-C defaults OFF by design (R2 verify) |
 
 #### Vendor access (third parties)
-- **Vendors 1 and 2**: BGP Site-to-Site VPNs into the Transit Gateway of BOTH production Regions. They reach the PLC-facing servers in AWS and the
-  plants' PLCs over SD-WAN (and the PLCs reply over SD-WAN to the VPN).
-- **Vendor 3**: BGP VPNs into both TGWs, reaching the servers only through private 1:1 DNAT ranges (100.64.10.0/24 -> PLC-A, 100.64.20.0/24 -> PLC-B)
+- **Vendors 1 and 2**: **policy-based** Site-to-Site VPNs into the Transit Gateway of BOTH production Regions. They reach the PLC-facing servers in AWS
+  and the plants' PLCs over SD-WAN. Each tunnel carries its own Region's destinations (traffic selectors) - so after a Region failure the vendor must move
+  those selectors to the other tunnel, unless it pre-configured a **backup peer** (what-if toggle).
+- **Vendor 3**: policy-based VPNs into both TGWs, reaching the servers only through private 1:1 DNAT ranges (100.64.10.0/24 -> PLC-A, 100.64.20.0/24 -> PLC-B)
   on the Palo Alto of each Region. Replies must return through the SAME Palo Alto that translated them.
+- **Data centre 1**: BGP VPN into both TGWs (assumed) - follows the routes by itself.
+- **SD-WAN**: a pair in each production Region (and one in us-east-2 for Option 2); both Regions are active.
 - At failover the PLC route set also goes into the TGW **VPN** and **firewall** tables; vendor 3's NAT range is added as two **/25s** (more specific than
   the /24 to the dead peering - additive, deleted at failback); the recovery Region's Palo Alto holds the **same DNAT rules pre-staged** (servers keep their IPs).
 - Option 2: the vendors have no VPN into us-east-2, so they enter through the **surviving** production Region (second route set + pre-staged rules on
@@ -271,7 +281,8 @@ Two production DR designs for PLC-facing servers whose IPs are hard-coded at the
 - **SD-WAN**: plants use the edge that advertises the most specific prefix; ties go to an edge whose route ends in a local VPC, then the home Region.
 - **Palo Alto**: plant and vendor traffic entering a Region needs a rule for the destination; DNAT is a firewall attachment in each TGW (translate,
   then route again); the what-if toggle removes the pre-staged PLC rules and DNAT rules.
-- **Vendor VPNs** use BGP: a vendor follows the most specific prefix any of its tunnels advertises.
+- **Vendor VPNs**: policy-based tunnels follow their selectors (first live tunnel in order) and drop replies that arrive on the other tunnel; BGP tunnels
+  follow the most specific prefix any tunnel advertises.
 - **Probes** are one-direction forward paths. Return paths, AD replication, DNS and DRS internals are not modelled.
 
 Addresses (10.10/16, 10.20/16, 10.30/16), server names and durations are illustrative. The building blocks (same-IP recovery, isolated drill,

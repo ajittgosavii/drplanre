@@ -13,7 +13,7 @@ def status(st, option, pid):
 
 
 def prod_ok(st, option):
-    return all(status(st, option, p) in ("ok", "n/a") for p in ("p1", "p2", "p3", "p4", "p5", "p6", "v1", "v2", "v3", "v4", "v5", "n1", "n2"))
+    return all(status(st, option, p) in ("ok", "n/a") for p in ("p1", "p2", "p3", "p4", "p5", "p6", "v1", "v2", "v3", "v4", "v5", "n1", "n2", "dc1", "dc2"))
 
 
 def test_build_keeps_production_and_replicates():
@@ -92,15 +92,23 @@ def test_vendors_follow_the_cutover():
     for o in (1, 2):
         steps = S.failover(o, "A")
         sts = states("Region failure - us-east-1 lost", o)
-        last_cut = max(i for i, x in enumerate(steps) if x["phase"] == "Cutover")
-        for i, st in enumerate(sts[1:last_cut + 2], 1):
-            for p in ("v2", "v3", "v4", "v5", "n2"):            # PLC access via SD-WAN and the healthy Region never breaks
-                assert status(st, o, p) == "ok", (o, i, p)
-        assert status(sts[1], o, "v1") == "fail" and status(sts[1], o, "n1") == "fail"
+        sw = next(i for i, x in enumerate(steps) if x["title"].startswith("Policy-based vendor VPNs"))
+        for i in range(1, sw):                                   # policy-based: even PLC access waits for the vendor
+            assert status(sts[i], o, "v2") == "fail" and status(sts[i], o, "v3") == "fail", (o, i)
+        for st in sts[sw:]:
+            for p in ("v2", "v3", "v4", "v5", "n2", "dc2"):
+                assert status(st, o, p) == "ok", (o, p)
         end = sts[-1]
         r = S.run_probe(end, next(x for x in S.probes(o) if x["id"] == "n1"))
         assert r["status"] == "ok" and r["dnat"] == ("B" if o == 1 else "C"), r   # DNAT moves to the recovery Region's Palo Alto
-        assert status(end, o, "v1") == "ok"
+        assert status(end, o, "v1") == "ok" and status(end, o, "dc1") == "ok"
+
+
+def test_vendor_backup_peer_keeps_plc_access():
+    for o in (1, 2):
+        for st in states("Region failure - us-east-1 lost", o, frozenset({"vendor_backup"})):
+            for p in ("v2", "v3", "v4", "v5"):
+                assert status(st, o, p) == "ok", (o, p)
 
 
 def test_option2_vendors_need_set_2():
@@ -114,13 +122,15 @@ def test_option2_vendors_need_set_2():
 
 def test_mirror_mistake_hits_vendors():
     s1 = states("What-if - mirror attachment mistake", 1)
-    assert status(s1[1], 1, "v1") == "fail" and status(s1[1], 1, "n1") == "ok"
+    assert status(s1[1], 1, "dc1") == "fail"                          # BGP site follows the propagated /24 into the empty mirror
+    assert status(s1[1], 1, "v1") == "ok" and status(s1[1], 1, "n1") == "ok"   # policy-based vendors follow selectors, not routes
 
 
 def test_failback_deletes_every_cutover_route():
     for o in (1, 2):
         end = states("Failback - return to us-east-1", o)[-1]
         assert S.E.route_set(end) == S.E.route_set(S.ready(o)), o
+        assert end["vendors"] == S.ready(o)["vendors"], o      # selectors back to normal
 
 
 def test_single_server():

@@ -35,8 +35,27 @@ def add_region(st, key, name):
     st["fw"].setdefault(key, {"plants": [], "vendors": [], "nat": {}})
 
 
-def add_vendor(st, key, label, cidr, ip, how):
-    st["vendors"][key] = {"label": label, "cidr": cidr, "ip": ip, "how": how}
+def add_vendor(st, key, label, cidr, ip, how, mode="bgp", sel=None):
+    """mode bgp = route-based, follows the most specific advert of any live tunnel.
+    mode policy = policy-based IPsec: sel maps destination prefix -> ordered Regions whose tunnel carries it
+    (first live one wins; a second Region = backup peer pre-configured on the vendor side)."""
+    st["vendors"][key] = {"label": label, "cidr": cidr, "ip": ip, "how": how, "mode": mode, "sel": dict(sel or {})}
+
+
+def policy_region(st, vendor, ip):
+    """Region whose tunnel a policy-based vendor uses for ip, or None (no selector / no live tunnel)."""
+    v = st["vendors"][vendor]
+    best = None
+    for c, regs in v["sel"].items():
+        if contains(c, ip) and (best is None or net(c).prefixlen > net(best).prefixlen):
+            best = c
+    if best is None:
+        return None, None
+    for r in v["sel"][best]:
+        if st["regions"].get(r, {}).get("up") and any(t["region"] == r and any(a["type"] == "vpn" and a["vendor"] == vendor for a in t["atts"].values())
+                                                       for t in st["tgws"].values()):
+            return r, best
+    return None, best
 
 
 def add_tgw(st, name, region, default_assoc=True, default_prop=True, assoc_rt="spoke", prop_rts=("spoke",), rts=("spoke",)):
@@ -245,7 +264,7 @@ def _deliver(st, vpc, ip, hops, text, ctx):
     return _res(False, f"no server with {ip} in {v['label']}", hops, text, **ctx)
 
 
-def send(st, src, ip):
+def send(st, src, ip, from_ip=None):
     """src = ("vpc", name) | ("plant", region_key) | ("vendor", vendor_key).
     Returns ok, reason, hops (diagram node ids), path text, firewalls traversed, dnat (Region that translated)."""
     hops, text = [], []
@@ -253,11 +272,20 @@ def send(st, src, ip):
     if src[0] in ("plant", "vendor"):
         kind, key = src
         hops.append(f"{kind}-{key}")
-        ch = ingress_choice(st, ip, kind, key, home=key if kind == "plant" else None)
         who = "SD-WAN" if kind == "plant" else f"{st['vendors'][key]['label']} VPN"
-        if not ch:
-            return _res(False, f"{who} has no route to {ip}", hops, text, **ctx)
-        _, reg, tgw, att, prefix = ch
+        if kind == "vendor" and st["vendors"][key]["mode"] == "policy":
+            reg, sel = policy_region(st, key, ip)
+            if not reg:
+                why = "no selector for it" if sel is None else f"selector {sel} only on tunnels that are down - no backup peer"
+                return _res(False, f"{who} (policy-based) cannot send to {ip}: {why}", hops, text, **ctx)
+            tgw = tgw_of_region(st, reg)
+            att = next(a for a, v in st["tgws"][tgw]["atts"].items() if v["type"] == "vpn" and v["vendor"] == key)
+            prefix = f"selector {sel}"
+        else:
+            ch = ingress_choice(st, ip, kind, key, home=key if kind == "plant" else None)
+            if not ch:
+                return _res(False, f"{who} has no route to {ip}", hops, text, **ctx)
+            _, reg, tgw, att, prefix = ch
         hops.append("edge-" + reg)
         text.append(f"{who} -> {st['regions'][reg]['name']} (best advert {prefix})")
         rules = st["fw"][reg]["plants" if kind == "plant" else "vendors"]
@@ -298,6 +326,12 @@ def send(st, src, ip):
             v = st["vendors"][a["vendor"]]
             hops.append("vendor-" + a["vendor"])
             ok = contains(v["cidr"], ip)
+            if ok and v["mode"] == "policy" and from_ip:
+                want, sel = policy_region(st, a["vendor"], from_ip)
+                here = st["tgws"][cur_tgw]["region"]
+                if want != here:
+                    return _res(False, f"{v['label']} (policy-based): reply arrives on the {st['regions'][here]['name']} tunnel but its selector "
+                                f"for {from_ip} is on {st['regions'][want]['name'] if want else 'no live tunnel'} - dropped", hops, text, **ctx)
             return _res(ok, f"delivered to {v['label']} over its VPN" if ok else f"sent to {v['label']} VPN, wrong destination", hops, text, **ctx)
         if a["type"] == "firewall":
             reg = st["tgws"][cur_tgw]["region"]

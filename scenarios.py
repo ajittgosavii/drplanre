@@ -19,9 +19,14 @@ DC = {"A": ("DCA01", "10.10.50.10"), "B": ("DCB01", "10.20.50.10"), "C": ("DCC01
 OTHER = {"A": "B", "B": "A"}
 # vendors: V1 / V2 = BGP S2S VPN into the TGW of BOTH Regions, reach PLC-facing servers and the plants' PLCs over SD-WAN;
 #          V3 = BGP S2S VPN into both TGWs, reaches the servers only through private 1:1 DNAT ranges on the Palo Altos
-VENDORS = {"V1": ("Vendor 1", "192.168.10.0/24", "192.168.10.10", "S2S VPN"),
-           "V2": ("Vendor 2", "192.168.20.0/24", "192.168.20.10", "S2S VPN"),
-           "V3": ("Vendor 3", "192.168.30.0/24", "192.168.30.10", "S2S VPN + DNAT")}
+VENDORS = {"V1": ("Vendor 1", "192.168.10.0/24", "192.168.10.10", "policy-based VPN", "policy"),
+           "V2": ("Vendor 2", "192.168.20.0/24", "192.168.20.10", "policy-based VPN", "policy"),
+           "V3": ("Vendor 3", "192.168.30.0/24", "192.168.30.10", "policy VPN + DNAT", "policy"),
+           "DC1": ("Data centre 1", "10.200.0.0/16", "10.200.1.10", "BGP VPN", "bgp")}
+# policy-based tunnels: destination -> Region whose tunnel carries it (each Region's prod + that Region's plants / NAT range)
+SELECTORS = {"V1": {"10.10.0.0/16": "A", "172.16.1.0/24": "A", "10.20.0.0/16": "B", "172.16.2.0/24": "B"},
+             "V3": {"100.64.10.0/24": "A", "100.64.20.0/24": "B"}}
+SELECTORS["V2"] = dict(SELECTORS["V1"])
 NAT = {"A": "100.64.10.0/24", "B": "100.64.20.0/24"}             # vendor-3 DNAT range -> PLC subnet, 1:1
 NATIP = {"SQLA01": "100.64.10.20", "SQLB01": "100.64.20.20"}
 PLANT_PLC = {"A": "172.16.1.50", "B": "172.16.2.50"}
@@ -35,12 +40,13 @@ def step(title, actor, minutes, text, fn=None, commands=(), checks=(), risk=None
 
 
 # ================================================================ production today
-def prod(option):
+def prod(option, whatif=frozenset()):
     st = E.new_state(option)
     for k in ("A", "B") + (("C",) if option == 2 else ()):
         E.add_region(st, k, REG[k])
-    for v, (label, cidr, ip, how) in VENDORS.items():
-        E.add_vendor(st, v, label, cidr, ip, how)
+    for v, (label, cidr, ip, how, mode) in VENDORS.items():
+        sel = {c: ([r, OTHER[r]] if "vendor_backup" in whatif else [r]) for c, r in SELECTORS.get(v, {}).items()}
+        E.add_vendor(st, v, label, cidr, ip, how, mode, sel)
     for k in ("A", "B"):
         o = "10.10" if k == "A" else "10.20"
         E.add_vpc(st, "VPC-" + k, k, [VPCR[k]], "prod", f"Production VPC {k}")
@@ -53,14 +59,14 @@ def prod(option):
         E.attach(st, t, "vpc-" + k, vpc="VPC-" + k)
         E.attach(st, t, "sdwan-" + k, kind="sdwan", assoc="sdwan", prop=["spoke", "peering", "vpn", "fw"])
         E.attach(st, t, "fw-" + k, kind="firewall", assoc="fw", prop=[])
-        for v in ("V1", "V2"):
+        for v in ("V1", "V2", "DC1"):
             E.attach(st, t, f"vpn-{v}-{k}", kind="vpn", vendor=v, assoc="vpn", prop=["spoke", "sdwan", "peering", "fw"])
         E.attach(st, t, f"vpn-V3-{k}", kind="vpn", vendor="V3", assoc="vpn", prop=["peering", "fw"])
         E.add_route(st, t, "spoke", VCIDR["V3"], "fw-" + k)          # vendor-3 replies return through the DNAT firewall
         E.add_route(st, t, "vpn", NAT[k], "fw-" + k)                 # own DNAT range -> own Palo Alto
         E.add_route(st, t, "peering", NAT[k], "fw-" + k)
         st["edges"][k] = True
-        st["fw"][k] = {"plants": [VPCR[k], VCIDR["V1"], VCIDR["V2"]], "vendors": [VPCR[k], E.PLANTS, "100.64.0.0/16"],
+        st["fw"][k] = {"plants": [VPCR[k], VCIDR["V1"], VCIDR["V2"], VCIDR["DC1"]], "vendors": [VPCR[k], E.PLANTS, "100.64.0.0/16"],
                        "nat": {NAT[k]: PLC[k]}}
     E.peer(st, "TGW-A", "TGW-B", "peer-AB", "peering", "peering")
     for k in ("A", "B"):
@@ -250,7 +256,7 @@ def build(steps, start, upto):
 
 @lru_cache(maxsize=None)
 def _ready_cached(option, whatif):
-    return build(rollout(option, whatif), prod(option), len(rollout(option, whatif)) - 1)
+    return build(rollout(option, whatif), prod(option, whatif), len(rollout(option, whatif)) - 1)
 
 
 def ready(option, whatif=frozenset()):
@@ -286,7 +292,7 @@ def _cmds(routes, verb="create"):
     return out
 
 
-def failover(option, k):
+def failover(option, k, whatif=frozenset()):
     """Real Region failure of k (A or B)."""
     sv = OTHER[k]
     S = [step("Normal operation - DR ready", "-", 0, "Both Regions in production, replication CONTINUOUS.", phase="Start")]
@@ -318,6 +324,21 @@ def failover(option, k):
                       f"(DNAT happens on the us-east-2 Palo Alto, which has the same rules pre-staged). {REG[sv]} workloads and all three vendors now reach the "
                       "recovered servers. Option 1 needs no second set - and the tooling does not print it yet (runbook).",
                       _apply(rs[f"TGW-{sv}"]), _cmds(rs[f"TGW-{sv}"]), ["Routes visible", f"{REG[sv]} reporting probe OK", "Vendor probes OK"], risk="HIGH*", phase="Cutover"))
+    def vendors_switch(st):
+        for v in st["vendors"].values():
+            for regs in v["sel"].values():
+                if regs[0] == k and sv not in regs:
+                    regs.append(sv)
+    auto = "vendor_backup" in whatif
+    S.append(step(f"Policy-based vendor VPNs move to the {REG[sv]} tunnel", "Vendors + Interface team", 0 if auto else 45,
+                  (f"Done already: each vendor pre-configured a backup peer, so its device moved the {REG[k]} selectors to the {REG[sv]} tunnel when the "
+                   f"{REG[k]} tunnel went down (DPD). " if auto else
+                   f"Policy-based tunnels do not follow routes: each vendor's device still sends {REG[k]} destinations (servers, NAT range AND the {REG[k]} "
+                   f"plants' PLCs) into the dead {REG[k]} tunnel. Every vendor must add those selectors to its {REG[sv]} tunnel - a call per vendor, during "
+                   "the incident. Pre-configured backup peers (what-if toggle) remove this step. ") +
+                  "Data centres on BGP move by themselves.", vendors_switch,
+                  [] if auto else [f"Vendor: add selectors {PLC[k]}, {NAT[k]}, {REG[k]} plant ranges to the {REG[sv]} tunnel (or enable the backup peer)"],
+                  ["Each vendor confirms; vendor probes OK"], risk=None if auto else "HIGH*", phase="Cutover"))
     mv = _mirror_name(k)
     def rec_db(st):
         E.add_host(st, SQL[k] + "-DR", IP[SQL[k]], mv, "db", copy_of=SQL[k])
@@ -334,7 +355,7 @@ def failover(option, k):
     return S
 
 
-def failback(option, k):
+def failback(option, k, whatif=frozenset()):
     sv = OTHER[k]
     S = [step(f"Running in DR since the {REG[k]} failure", "-", 0, "Copies serve the plants from the " + ("other production Region." if option == 1 else "DR Region."), phase="Start")]
     def up(st):
@@ -358,6 +379,14 @@ def failback(option, k):
     S.append(step("Delete the failover route" + ("" if option == 1 else " sets (both TGWs)"), "Network team (pre-approved)", 10,
                   "Every route the cutover added is deleted; traffic falls back to the original Region's routes. SD-WAN and the vendors' BGP withdraw the /24 and /25s.",
                   del_routes, _cmds(allr, "delete"), phase="Window"))
+    def vendors_back(st):
+        for v in st["vendors"].values():
+            for regs in v["sel"].values():
+                if regs[0] == k and sv in regs and "vendor_backup" not in whatif:
+                    regs.remove(sv)
+    S.append(step(f"Vendors move their {REG[k]} selectors back", "Vendors + Interface team", 0 if "vendor_backup" in whatif else 30,
+                  "With backup peers the vendors return to the primary tunnel by themselves; otherwise each vendor removes the temporary selectors.",
+                  vendors_back, phase="Window"))
     def start_p(st):
         E.host(st, SQL[k])["state"] = "running"
         E.host(st, APP[k])["state"] = "running"
@@ -373,9 +402,9 @@ def failback(option, k):
     return S
 
 
-def failback_start(option, k):
-    st = ready(option)
-    f = failover(option, k)
+def failback_start(option, k, whatif=frozenset()):
+    st = ready(option, whatif)
+    f = failover(option, k, whatif)
     return build(f, st, len(f) - 1)
 
 
@@ -460,10 +489,10 @@ def single_server(option):
 
 # ================================================================ catalogue
 SCENARIOS = {
-    "Build - rollout to DR ready": (lambda o, w: rollout(o, w), lambda o, w: prod(o)),
-    "Region failure - us-east-1 lost": (lambda o, w: failover(o, "A"), lambda o, w: ready(o, w)),
-    "Region failure - us-west-2 lost": (lambda o, w: failover(o, "B"), lambda o, w: ready(o, w)),
-    "Failback - return to us-east-1": (lambda o, w: failback(o, "A"), lambda o, w: failback_start(o, "A")),
+    "Build - rollout to DR ready": (lambda o, w: rollout(o, w), lambda o, w: prod(o, w)),
+    "Region failure - us-east-1 lost": (lambda o, w: failover(o, "A", w), lambda o, w: ready(o, w)),
+    "Region failure - us-west-2 lost": (lambda o, w: failover(o, "B", w), lambda o, w: ready(o, w)),
+    "Failback - return to us-east-1": (lambda o, w: failback(o, "A", w), lambda o, w: failback_start(o, "A", w)),
     "Isolated drill - us-east-1 servers": (lambda o, w: drill(o, "A"), lambda o, w: ready(o, w)),
     "What-if - mirror attachment mistake": (lambda o, w: hijack(o), lambda o, w: hijack_start(o)),
     "Single-server failure (Region healthy)": (lambda o, w: single_server(o), lambda o, w: ready(o, w)),
@@ -492,9 +521,11 @@ def probes(option):
         {"id": "p8", "group": "Recovered", "label": f"Recovered PLC-B copy -> {dc_for_b[0]} (logon)", "src": ("vpc", "MIR-B"), "ip": dc_for_b[1], "expect": "deliver", "needs_copy": "MIR-B"},
         {"id": "v1", "group": "Vendors", "label": "Vendor 1 (VPN) -> SQLA01 server", "src": ("vendor", "V1"), "ip": IP["SQLA01"], "expect": "deliver"},
         {"id": "v2", "group": "Vendors", "label": "Vendor 1 (VPN) -> east plant PLC via SD-WAN", "src": ("vendor", "V1"), "ip": PLANT_PLC["A"], "expect": "deliver"},
-        {"id": "v3", "group": "Vendors", "label": "East plant PLC -> Vendor 1 (return)", "src": ("plant", "A"), "ip": VENDORS["V1"][2], "expect": "deliver"},
+        {"id": "v3", "group": "Vendors", "label": "East plant PLC -> Vendor 1 (return)", "src": ("plant", "A"), "ip": VENDORS["V1"][2], "expect": "deliver", "from_ip": PLANT_PLC["A"]},
         {"id": "v4", "group": "Vendors", "label": "Vendor 2 (VPN) -> SQLB01 server", "src": ("vendor", "V2"), "ip": IP["SQLB01"], "expect": "deliver"},
         {"id": "v5", "group": "Vendors", "label": "Vendor 2 (VPN) -> west plant PLC via SD-WAN", "src": ("vendor", "V2"), "ip": PLANT_PLC["B"], "expect": "deliver"},
+        {"id": "dc1", "group": "Data centres", "label": "Data centre 1 (BGP VPN) -> SQLA01", "src": ("vendor", "DC1"), "ip": IP["SQLA01"], "expect": "deliver"},
+        {"id": "dc2", "group": "Data centres", "label": "Data centre 1 (BGP VPN) -> SQLB01", "src": ("vendor", "DC1"), "ip": IP["SQLB01"], "expect": "deliver"},
         {"id": "n1", "group": "Vendor DNAT", "label": f"Vendor 3 -> {NATIP['SQLA01']} (DNAT to SQLA01), round trip", "src": ("vendor", "V3"), "ip": NATIP["SQLA01"], "expect": "deliver", "roundtrip": True},
         {"id": "n2", "group": "Vendor DNAT", "label": f"Vendor 3 -> {NATIP['SQLB01']} (DNAT to SQLB01), round trip", "src": ("vendor", "V3"), "ip": NATIP["SQLB01"], "expect": "deliver", "roundtrip": True},
         {"id": "d1", "group": "Drill isolation", "label": f"Drill copy -> {dc_for_a[0]} (must be blocked)", "src": ("vpc", bub), "ip": dc_for_a[1], "expect": "block", "needs_copy": bub},
@@ -515,9 +546,9 @@ def run_probe(st, p):
         return {"status": "n/a", "reason": "source not built", "hops": [], "path": []}
     if p["src"][0] == "vpc" and not st["regions"][st["vpcs"][p["src"][1]]["region"]]["up"]:
         return {"status": "n/a", "reason": "source Region is down", "hops": [], "path": []}
-    r = E.send(st, p["src"], p["ip"])
+    r = E.send(st, p["src"], p["ip"], from_ip=p.get("from_ip"))
     if p.get("roundtrip") and r["ok"]:
-        back = E.send(st, ("vpc", r["served_vpc"]), st["vendors"][p["src"][1]]["ip"])
+        back = E.send(st, ("vpc", r["served_vpc"]), st["vendors"][p["src"][1]]["ip"], from_ip=p["ip"])
         r["path"] = r["path"] + ["-- return --"] + back["path"]
         if not back["ok"]:
             r.update(ok=False, reason="reply lost: " + back["reason"])

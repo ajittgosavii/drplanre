@@ -27,8 +27,8 @@ for _lay in LAYOUT.values():
     for _g in ("tgw", "edge", "plant"):
         _lay[_g] = {k: (x, y + TOP) for k, (x, y) in _lay[_g].items()}
     _lay["vpc"] = {k: (x, y + TOP, w) for k, (x, y, w) in _lay["vpc"].items()}
-LAYOUT[1]["vendor"] = {"V1": (300, 42), "V2": (600, 42), "V3": (900, 42)}
-LAYOUT[2]["vendor"] = {"V1": (130, 42), "V2": (390, 42), "V3": (650, 42)}
+LAYOUT[1]["vendor"] = {"V1": (150, 42), "V2": (450, 42), "V3": (750, 42), "DC1": (1050, 42)}
+LAYOUT[2]["vendor"] = {"V1": (150, 42), "V2": (450, 42), "V3": (750, 42), "DC1": (1050, 42)}
 FILL = {"prod": (COL["prod"], COL["prodL"]), "mirror": (COL["dr"], COL["rust"]), "bubble": (COL["drill"], COL["green"]),
         "dr": (COL["dr"], COL["amber"]), "ad": (COL["ad"], "#B58B00")}
 DOT = {"running": COL["green"], "stopped": COL["muted"], "down": COL["rust"]}
@@ -151,7 +151,7 @@ def svg(st, path=None, added_targets=(), title=""):
         up = st["regions"][k]["up"]
         hh = 62 if st["fw"].get(k, {}).get("nat") else 44
         out.append(f'<rect x="{cx - 105}" y="{cy - 22}" width="210" height="{hh}" rx="8" fill="{"#F4F6F9" if up else COL["down"]}" stroke="{COL["muted"]}" stroke-width="1.5"/>')
-        out.append(_t(cx, cy - 3, f"Palo Alto + SD-WAN {k}", 13, COL["ink"], "bold", "middle"))
+        out.append(_t(cx, cy - 3, f"Palo Alto + SD-WAN pair {k}", 13, COL["ink"], "bold", "middle"))
         fw = st["fw"].get(k, {"plants": [], "nat": {}})
         rules = ", ".join(c for c in fw["plants"] if c.startswith("10.") and c.endswith("/24")) or "-"
         out.append(_t(cx, cy + 14, "PLC rules: " + rules, 10, COL["muted"], anchor="middle"))
@@ -184,7 +184,9 @@ def svg(st, path=None, added_targets=(), title=""):
         v = st["vendors"][k]
         out.append(f'<rect x="{cx - 115}" y="{cy - 24}" width="230" height="46" rx="8" fill="#F3EFFA" stroke="{COL["purple"]}" stroke-width="1.6"/>')
         out.append(_t(cx, cy - 6, f'{v["label"]} - {v["how"]}', 13, COL["purple"], "bold", "middle"))
-        out.append(_t(cx, cy + 12, v["cidr"] + ("  ->  DNAT ranges" if "DNAT" in v["how"] else "  ->  servers + PLCs"), 11, COL["muted"], anchor="middle"))
+        reach = "DNAT ranges" if "DNAT" in v["how"] else ("servers" if v["mode"] == "bgp" else "servers + PLCs")
+        moved = any(len(r) > 1 for r in v["sel"].values())
+        out.append(_t(cx, cy + 12, v["cidr"] + "  ->  " + reach + ("  (backup peer)" if moved else ""), 11, COL["muted"], anchor="middle"))
     # plants
     for k, (cx, cy) in lay["plant"].items():
         out.append(f'<rect x="{cx - 120}" y="{cy - 20}" width="240" height="40" rx="8" fill="#FFFFFF" stroke="{COL["navy"]}" stroke-width="1.6"/>')
