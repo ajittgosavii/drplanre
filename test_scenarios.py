@@ -13,7 +13,7 @@ def status(st, option, pid):
 
 
 def prod_ok(st, option):
-    return all(status(st, option, p) in ("ok", "n/a") for p in ("p1", "p2", "p3", "p4", "p5", "p6", "v1", "v2", "v3", "v4", "v5", "n1", "n2", "dc1", "dc2"))
+    return all(status(st, option, p) in ("ok", "n/a") for p in ("p1", "p2", "p3", "p4", "p5", "p6", "v1", "v2", "v3", "v4", "v5", "v6", "n1", "n2", "dc1", "dc2"))
 
 
 def test_build_keeps_production_and_replicates():
@@ -96,7 +96,7 @@ def test_vendors_follow_the_cutover():
         for i in range(1, sw):                                   # policy-based: even PLC access waits for the vendor
             assert status(sts[i], o, "v2") == "fail" and status(sts[i], o, "v3") == "fail", (o, i)
         for st in sts[sw:]:
-            for p in ("v2", "v3", "v4", "v5", "n2", "dc2"):
+            for p in ("v2", "v3", "v4", "v5", "v6", "n2", "dc2"):
                 assert status(st, o, p) == "ok", (o, p)
         end = sts[-1]
         r = S.run_probe(end, next(x for x in S.probes(o) if x["id"] == "n1"))
@@ -107,7 +107,7 @@ def test_vendors_follow_the_cutover():
 def test_vendor_backup_peer_keeps_plc_access():
     for o in (1, 2):
         for st in states("Region failure - us-east-1 lost", o, frozenset({"vendor_backup"})):
-            for p in ("v2", "v3", "v4", "v5"):
+            for p in ("v2", "v3", "v4", "v5", "v6"):
                 assert status(st, o, p) == "ok", (o, p)
 
 
@@ -122,8 +122,9 @@ def test_option2_vendors_need_set_2():
 
 def test_mirror_mistake_hits_vendors():
     s1 = states("What-if - mirror attachment mistake", 1)
-    assert status(s1[1], 1, "dc1") == "fail"                          # BGP site follows the propagated /24 into the empty mirror
-    assert status(s1[1], 1, "v1") == "ok" and status(s1[1], 1, "n1") == "ok"   # policy-based vendors follow selectors, not routes
+    assert status(s1[1], 1, "p1") == "fail" and status(s1[1], 1, "p3") == "fail"   # plants + us-west-2 workloads hijacked
+    for p in ("v1", "n1", "dc1"):                                         # VPN table points at the firewall: no propagated /24 there
+        assert status(s1[1], 1, p) == "ok", p
 
 
 def test_failback_deletes_every_cutover_route():
@@ -131,6 +132,14 @@ def test_failback_deletes_every_cutover_route():
         end = states("Failback - return to us-east-1", o)[-1]
         assert S.E.route_set(end) == S.E.route_set(S.ready(o)), o
         assert end["vendors"] == S.ready(o)["vendors"], o      # selectors back to normal
+
+
+def test_reply_must_pass_the_inspecting_firewall():
+    end = states("Region failure - us-east-1 lost", 2)[-1]
+    assert status(end, 2, "dc1") == "ok"
+    S.E.add_route(end, "TGW-B", "peering", S.VCIDR["DC1"], "vpn-DC1-B")   # reply from us-east-2 sent straight to the VPN, skipping firewall B
+    r = S.run_probe(end, next(x for x in S.probes(2) if x["id"] == "dc1"))
+    assert r["status"] == "fail" and "asymmetric" in r["reason"], r
 
 
 def test_single_server():

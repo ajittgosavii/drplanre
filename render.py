@@ -27,8 +27,8 @@ for _lay in LAYOUT.values():
     for _g in ("tgw", "edge", "plant"):
         _lay[_g] = {k: (x, y + TOP) for k, (x, y) in _lay[_g].items()}
     _lay["vpc"] = {k: (x, y + TOP, w) for k, (x, y, w) in _lay["vpc"].items()}
-LAYOUT[1]["vendor"] = {"V1": (150, 42), "V2": (450, 42), "V3": (750, 42), "DC1": (1050, 42)}
-LAYOUT[2]["vendor"] = {"V1": (150, 42), "V2": (450, 42), "V3": (750, 42), "DC1": (1050, 42)}
+LAYOUT[1]["vendor"] = {"V1": (230, 42), "V3": (600, 42), "DC1": (970, 42)}
+LAYOUT[2]["vendor"] = {"V1": (230, 42), "V3": (600, 42), "DC1": (970, 42)}
 FILL = {"prod": (COL["prod"], COL["prodL"]), "mirror": (COL["dr"], COL["rust"]), "bubble": (COL["drill"], COL["green"]),
         "dr": (COL["dr"], COL["amber"]), "ad": (COL["ad"], "#B58B00")}
 DOT = {"running": COL["green"], "stopped": COL["muted"], "down": COL["rust"]}
@@ -184,7 +184,7 @@ def svg(st, path=None, added_targets=(), title=""):
         v = st["vendors"][k]
         out.append(f'<rect x="{cx - 115}" y="{cy - 24}" width="230" height="46" rx="8" fill="#F3EFFA" stroke="{COL["purple"]}" stroke-width="1.6"/>')
         out.append(_t(cx, cy - 6, f'{v["label"]} - {v["how"]}', 13, COL["purple"], "bold", "middle"))
-        reach = "DNAT ranges" if "DNAT" in v["how"] else ("servers" if v["mode"] == "bgp" else "servers + PLCs")
+        reach = "DNAT + PLCs" if "DNAT" in v["how"] else ("servers" if v["mode"] == "bgp" else "servers + PLCs")
         moved = any(len(r) > 1 for r in v["sel"].values())
         out.append(_t(cx, cy + 12, v["cidr"] + "  ->  " + reach + ("  (backup peer)" if moved else ""), 11, COL["muted"], anchor="middle"))
     # plants

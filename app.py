@@ -262,18 +262,19 @@ Two production DR designs for PLC-facing servers whose IPs are hard-coded at the
 | Cutover | One static /24 route set in the surviving TGW | Two route sets: TGW-C + surviving TGW |
 | Mirror attachment | Production TGW, defaults ON - S1 window | TGW-C defaults OFF by design (R2 verify) |
 
-#### Vendor access (third parties)
-- **Vendors 1 and 2**: **policy-based** Site-to-Site VPNs into the Transit Gateway of BOTH production Regions. They reach the PLC-facing servers in AWS
-  and the plants' PLCs over SD-WAN. Each tunnel carries its own Region's destinations (traffic selectors) - so after a Region failure the vendor must move
-  those selectors to the other tunnel, unless it pre-configured a **backup peer** (what-if toggle).
-- **Vendor 3**: policy-based VPNs into both TGWs, reaching the servers only through private 1:1 DNAT ranges (100.64.10.0/24 -> PLC-A, 100.64.20.0/24 -> PLC-B)
-  on the Palo Alto of each Region. Replies must return through the SAME Palo Alto that translated them.
-- **Data centre 1**: BGP VPN into both TGWs (assumed) - follows the routes by itself.
-- **SD-WAN**: a pair in each production Region (and one in us-east-2 for Option 2); both Regions are active.
-- At failover the PLC route set also goes into the TGW **VPN** and **firewall** tables; vendor 3's NAT range is added as two **/25s** (more specific than
-  the /24 to the dead peering - additive, deleted at failback); the recovery Region's Palo Alto holds the **same DNAT rules pre-staged** (servers keep their IPs).
-- Option 2: the vendors have no VPN into us-east-2, so they enter through the **surviving** production Region (second route set + pre-staged rules on
-  its Palo Alto). Alternative: give the vendors tunnels into TGW us-east-2 as well.
+#### Vendor and data-centre access
+- **Vendor 1**: **policy-based** Site-to-Site VPNs into the Transit Gateway of BOTH production Regions; reaches the PLC-facing servers and the plants'
+  PLCs over SD-WAN. Each tunnel carries its own Region's destinations (traffic selectors), so after a Region failure the vendor must move them to the
+  other tunnel - unless it pre-configured a **backup peer** (what-if toggle).
+- **Vendor 2**: policy-based VPNs into both TGWs; reaches the servers only through private 1:1 DNAT ranges (100.64.10.0/24 -> PLC-A,
+  100.64.20.0/24 -> PLC-B) on each Region's Palo Alto, and the plants' PLCs over SD-WAN.
+- **Data centre 1**: BGP VPN into both TGWs - follows the routes by itself.
+- **Inspection**: all vendor and data-centre traffic is inspected by the Palo Alto of the Region it enters (the TGW VPN table points at the firewall).
+  Every round trip is checked: the reply must pass every Palo Alto that saw the request (inspection state, DNAT).
+- At failover the PLC /24 goes into the surviving TGW's spoke, SD-WAN and **firewall** tables. Option 1: the surviving Palo Alto holds vendor 2's DNAT
+  pre-staged and translates before routing. Option 2: vendors and data centres are inspected in the surviving Region, then cross to us-east-2 (vendor 2's
+  NAT range as two **/25s**, DNAT on the us-east-2 Palo Alto); replies are routed back through the same firewalls.
+- **SD-WAN**: a pair in each production Region (and in us-east-2 for Option 2); both Regions are active.
 
 #### How the model works
 - **Transit Gateway routing**: a packet entering a TGW is looked up in the table associated with its attachment; longest prefix wins; static routes to a peering stay even when the peer Region is down (blackhole).

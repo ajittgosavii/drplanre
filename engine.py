@@ -219,11 +219,22 @@ def ingress_choice(st, ip, kind, key, home=None):
         if not m:
             continue
         reg = t["region"]
-        local = t["atts"][m["target"]]["type"] != "peering"
+        local = _ends_local(st, tgw, m["target"], ip)
         score = (net(m["cidr"]).prefixlen, local, reg == home, -ORDER[reg])
         if best is None or score > best[0]:
             best = (score, reg, tgw, att, m["cidr"])
     return best
+
+
+def _ends_local(st, tgw, att, ip):
+    """True when a route's target delivers ip in this Region (looks through a firewall attachment to its own table)."""
+    t = st["tgws"][tgw]
+    a = t["atts"][att]
+    if a["type"] == "firewall":
+        rt = rt_of(st, tgw, att)
+        m = lpm(t["rts"][rt]["routes"], ip) if rt else None
+        return bool(m) and t["atts"][m["target"]]["type"] not in ("peering", "firewall")
+    return a["type"] != "peering"
 
 
 def advertised(st, tgw, kind="plant", key=None):
@@ -343,8 +354,6 @@ def send(st, src, ip, from_ip=None):
                 new = str(net(nat[1]).network_address + (int(ipaddress.ip_address(ip)) - int(net(nat[0]).network_address)))
                 text.append(f"Palo Alto {st['regions'][reg]['name']} DNAT {ip} -> {new}")
                 ip, ctx["dnat"] = new, reg
-            elif contains(NAT_SPACE, ip):
-                return _res(False, f"Palo Alto {st['regions'][reg]['name']}: no DNAT rule for {ip} (dropped)", hops, text, **ctx)
             else:
                 text.append(f"Palo Alto {st['regions'][reg]['name']} inspects")
             cur_att = m["target"]            # re-enter the same TGW from the firewall attachment
